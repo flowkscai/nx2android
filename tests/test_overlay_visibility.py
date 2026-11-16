@@ -31,9 +31,11 @@ class OverlayVisibility(unittest.TestCase):
 #include <string.h>
 #include "front.h"
 #include "overlay_layout.h"
+#include "present_pic.h"
 static _Atomic int g_set_overlay, g_overlay, g_pads, g_edit;
 static _Atomic int g_cust[2][2][OV_N][4];
 static _Atomic int g_set_rumble, g_set_fps, g_set_labels, g_menu_tab, g_sv_st;
+static _Atomic int g_set_aa, g_set_scale;
 static int layout, saves;
 int dm_overlay_layout(void) { return layout; }
 float dm_overlay_scale(void) { return 1; }

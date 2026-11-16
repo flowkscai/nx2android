@@ -47,7 +47,7 @@ subprocess.run([sys.executable, str(DM / 'android/tools/android_profile.py'), 'h
 
 # the backend's own small shaders (dm/android/shaders): compiled with the NDK's glslc, embedded as gen/<name>_<stage>.spv.h
 GLSLC = Path(a.ndk) / 'shader-tools' / host_dir('shader-tools', 'glslc') / ('glslc.exe' if os.name == 'nt' else 'glslc')
-for sh in sorted((DM / 'android/shaders').glob('*.*')):
+for sh in sorted(p for p in (DM / 'android/shaders').iterdir() if p.suffix in ('.vert', '.frag', '.comp')):
     hdr = gen / a.game / f'{sh.stem}_{sh.suffix[1:]}.spv.h'
     if hdr.exists() and hdr.stat().st_mtime >= sh.stat().st_mtime: continue
     spv = gen / f'{sh.name}.spv'

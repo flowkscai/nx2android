@@ -1,0 +1,8 @@
+fxaa.frag is an independent implementation, written for this project, of the FXAA 3.11
+algorithm published by Timothy Lottes at NVIDIA: one luma-edge blend. It is not a copy
+of NVIDIA's FXAA3_11.h. The one FXAA option uses the published quality preset 15,
+whose edge search takes 8 steps.
+
+The algorithm is described in Timothy Lottes, "FXAA", NVIDIA, 2009-2012.
+NVIDIA's FXAA3_11.h is Copyright (c) 2010-2012 NVIDIA Corporation. All rights reserved.
+This file's shader source is original and is covered by the licence of this project.

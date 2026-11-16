@@ -48,6 +48,16 @@ class AndroidProfiles(unittest.TestCase):
         for v in ('10', '85', '42'):
             with self.assertRaises(android_profile.ProfileError, msg=v): android_profile.load(profile_dir([('status', 'boots'), ('setting', f'opacity={v}')]).name)
 
+    def test_picture_settings(self):   # Anti-aliasing, Scaling filter and Sharpness (present_pic.h, front_android.c settings_load)
+        for aa in range(6):
+            self.assertEqual(android_profile.load(profile_dir([('status', 'boots'), ('setting', f'aa={aa}')]).name).settings['aa'], str(aa))
+        for scale in range(5):
+            self.assertEqual(android_profile.load(profile_dir([('status', 'boots'), ('setting', f'scale={scale}')]).name).settings['scale'], str(scale))
+        for sharp in ('0', '25', '50', '75', '100'):
+            self.assertEqual(android_profile.load(profile_dir([('status', 'boots'), ('setting', f'sharpness={sharp}')]).name).settings['sharpness'], sharp)
+        for row in ('aa=6', 'scale=5', 'sharpness=10', 'sharpness=1'):
+            with self.assertRaises(android_profile.ProfileError, msg=row): android_profile.load(profile_dir([('status', 'boots'), ('setting', row)]).name)
+
     def test_default_package(self):
         d = profile_dir([('status', 'boots')])
         self.assertEqual(android_profile.load(d.name).package, 'org.nx2a.t0100000000aaa000')

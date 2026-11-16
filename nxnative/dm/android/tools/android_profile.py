@@ -8,7 +8,8 @@
 #   requires     device features, separated by spaces: bcn (BC texture compression)
 #   sysdata      system data titles the game reads from the console's firmware, 16-digit hex title IDs separated by spaces (0100000000000802: MiiModel, the Mii heads Mario Kart 8 Deluxe builds; 0100000000000811 and 0100000000000810: the shared fonts, standard and Nintendo extension; 0100000000000814, 0100000000000813 and 0100000000000812: simplified Chinese, traditional Chinese and Korean);
 #                porter extracts each from the player's firmware dump (--firmware) into the data pack, and the host mounts it in place of its stand-in (the fonts: the host decodes them)
-#   setting      <name>=<value>, one row each: the pause menu's defaults on first launch (overlay, rumble, docked, fps, opacity: 20..80 by 5)
+#   setting      <name>=<value>, one row each: the pause menu's defaults on first launch (overlay, rumble, docked, fps, opacity: 20..80 by 5,
+#                aa: 0 off, 1 FXAA, 2..5 SMAA Low..Ultra, scale: 0 Bilinear, 1 Nearest, 2 Area, 3 FSR, 4 SGSR, sharpness: 0|25|50|75|100)
 #   env          <KEY>=<VALUE>, one row each: host switches the game needs on Android (the data pack's env.txt)
 #   overlay      <tablet|phone> <control> <x> <y>: moves one control of that layout (dm/android/overlay_default.tsv) to x, y as fractions of the window
 #   romfs        raw (default) | zstd: zstd puts the RomFS files that compress in the data pack as packed files (porter/romfs_pack.py), which the host reads back
@@ -26,7 +27,10 @@ import game   # noqa: E402  (the profile folders, DM_GAMES_DIR included)
 
 STATUS = ('playable', 'wip', 'boots', 'experimental')
 SETTINGS = {'overlay': ('0', '1'), 'rumble': ('0', '1'), 'docked': ('0', '1'), 'fps': ('0', '1'),   # the pause menu's settings (front_android.c settings_load)
-            'opacity': tuple(str(v) for v in range(20, 81, 5))}                                    # the gamepad's, percent (overlay_layout.h OV_OPACITY_MIN..MAX)
+            'opacity': tuple(str(v) for v in range(20, 81, 5)),                                    # the gamepad's, percent (overlay_layout.h OV_OPACITY_MIN..MAX)
+            'aa': tuple(str(v) for v in range(6)),                                                 # present_pic.h PIC_AA_*: off, FXAA, SMAA Low..Ultra
+            'scale': tuple(str(v) for v in range(5)),                                              # PIC_SCALE_*: Bilinear, Nearest, Area, FSR, SGSR
+            'sharpness': tuple(str(v) for v in range(0, 101, 25))}                                 # FSR and SGSR, the menu's steps (the loader also keeps any 0..100)
 REQUIRES = ('bcn',)
 KINDS = {'stick_l': 'OV_STICK_L', 'stick_r': 'OV_STICK_R', 'button': 'OV_BUTTON', 'dpad': 'OV_DPAD', 'menu': 'OV_MENU'}
 SINGLE = ('status', 'tested', 'package', 'orientation', 'requires', 'sysdata', 'romfs')
