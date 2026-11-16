@@ -2737,7 +2737,6 @@ static void bind_handles_rec(uint32_t op, const void *a) {
     }
 }
 uint32_t g_sub_ops[64];   // record ops replayed in the open submission, by op (logged when the driver refuses it)
-static void exec_ops(const uint8_t *p);
 // DM_VK_PROF=1 (start-up): a 1 ms CPU-time timer on the replay thread samples where it is; every 20 s the most frequent places are logged: offsets in this library,
 // time in other libraries charged to the first caller of ours ("via:"), or with =2 the place itself (libc, the driver). Resolve offsets with llvm-symbolizer
 // on the debug build's libdmhost.so. Simpleperf is refused on retail devices; this found the command pool resets and render pass begins that took half the replay
@@ -2781,14 +2780,20 @@ static void prof_tick(void) {
         cnt[b] = 0; }
     VKLOG("%s", line);
 }
+static void exec_span(const uint8_t *p, const uint8_t *end);
+static void exec_on_span(const uint8_t *s, const uint8_t *e, void *ctx) { (void)ctx; exec_span(s, e); }
+static void exec_handle(const uint8_t *p) {
+    if (!nvn_walk_records(p, exec_on_span, NULL)) exec_span(p, NULL);   // a control-list handle is walked in place; compact records expand one at a time
+}
 void mtl_exec(const uint8_t *p) {   // timed at the top level only (OP_CALL nests)
     static int depth; uint64_t t0 = depth ? 0 : tnow(); depth++; if (depth == 1) prof_tick();
-    exec_ops(p);
+    exec_handle(p);
     if (!--depth) g_vkst.ns_exec += tnow() - t0;
 }
-static void exec_ops(const uint8_t *p) {
-    for (;;) {
+static void exec_span(const uint8_t *p, const uint8_t *end) {
+    while (!end || p < end) {
         op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8) return;
         if (h.op < 64) g_sub_ops[h.op]++;
         static uint64_t skip = ~0ull; if (skip == ~0ull) { skip = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) skip |= 1ull << v; q = *n ? n + 1 : n; } }   // debugging: record ops not replayed
         if (h.op < 64 && h.op > 3 && (skip >> h.op & 1)) { p += h.size; continue; }
@@ -2797,7 +2802,7 @@ static void exec_ops(const uint8_t *p) {
         case OP_END: return;
         case OP_BEGIN: break;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_ops((const uint8_t *)(uintptr_t)t); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_handle((const uint8_t *)(uintptr_t)t); break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); if (g_x_tracepass == -2) VKLOG("--- report counter type %#llx to %#llx", (unsigned long long)t, (unsigned long long)ad); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: break;

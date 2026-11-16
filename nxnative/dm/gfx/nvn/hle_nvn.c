@@ -1,5 +1,5 @@
 // NVN interface layer: takes over the nvnBootstrapLoader imported by main; the NVN driver in sdk is not executed at all.
-// All 523 NVN names return counting thunks (nvn_thunks.S), and the thunks forward to the implementations here:
+// All 523 NVN names return uncounted thunks (nvn_thunks.S) unless call counts are asked for (DM_NVN_COUNT, or DM_NVN_TSV without DM_NVN_TSV_CALLS=0). The thunks forward to the implementations here:
 //   - those with semantics (device / memory pools / textures and samplers / queue / window / sync / events / command buffer memory) are implemented per NVN semantics, and the objects are real;
 //   - those that only change GPU state and have no CPU-visible result (state objects, bindings, draws, clears...) are recorded as commands and replayed at submit;
 //   - the rest (the 307 that main only loads but never calls + those without a prototype in the header) go to nvn_unimpl_entry: reports a failure and prints the name when called.
@@ -43,7 +43,8 @@
 typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
 nvn_slot_t nvn_slot[NVN_NFUNC];                 // The thunk accesses it by i*16; the layout must not change
 _Static_assert(sizeof(nvn_slot_t) == 16, "the trampolines are addressed in 16-byte steps");
-extern void *nvn_thunk[NVN_NFUNC];
+extern void *nvn_thunk[NVN_NFUNC];          // uncounted entries: the default, no per-call stadd
+extern void *nvn_thunk_count[NVN_NFUNC];    // stadd entries, installed only while nvn_counting() is set
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
 extern void nvn_prof_entry(void);
@@ -102,10 +103,20 @@ static void nvn_prof_install(void) {
         if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
     LOG("[nvn] DM_NVN_PROF: timing wrappers on every implemented function");
 }
+// Call counts are off unless a diagnostic asked for them. The default thunk then skips the stadd on every NVN call.
+static int nvn_counting(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NVN_COUNT"), *c = getenv("DM_NVN_TSV_CALLS");
+        v = (e && atoi(e)) || (getenv("DM_NVN_TSV") && !(c && !atoi(c)));
+    }
+    return v;
+}
 static void *nvn_lookup(const char *name) {
     nvn_init_slots(); nvn_prof_install();
+    void **tab = nvn_counting() ? nvn_thunk_count : nvn_thunk;
     for (unsigned i = 0; i < NVN_NFUNC; i++)
-        if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
+        if (!strcmp(nvn_names[i], name)) return tab[i];
     LOG("[RED] NVN address lookup of an unknown name: %s", name ? name : "(null)");
     return NULL;
 }
@@ -768,13 +779,9 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; uint64_t t0 = now_ns(); nvn_dr
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
-// Room kept at the segment end after every record but the END: one JUMP. The END needs none (nothing follows it), and every other record is at least 16 bytes, so a JUMP
-// only ever stands where a record was to go: linking never writes past the bytes the recording takes in one piece, which is what GetCommandMemoryUsed reports and games size
-// command memory by. Tears of the Kingdom (GitHub issue #61) gives each model's prerecorded lists fixed slots of the size a recording of that list measured, slot k at
-// base + size × k, and passes AddCommandMemory max(size, 512) (main+0xbb120). With 24 bytes kept for "a JUMP or an END", a 496-byte list's END did not fit in 512,
-// went to a host segment, and the 16-byte JUMP at 488 reached 8 bytes into the next slot; recording that slot wrote its first record over the JUMP's target, and the
-// replay jumped to 0x1000000003 (that CALL record's header) after 8 to 30 minutes of play
-#define OP_RESERVE 16
+// Command memory holds only the records. The end of a recording, the link between pieces, and calls live in the control list (nvn_obj.h ctl_e), so nothing is written past
+// what GetCommandMemoryUsed reported. Tears of the Kingdom (GitHub issue #61) packs prerecorded lists into slots of that size; a JUMP written after the last record reached
+// into the next slot and the replay later jumped to a corrupted target.
 
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
@@ -800,12 +807,13 @@ static void cs_dump(void) {   // Called once per frame (at present)
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); }
-// New segment: if the recording in progress has records, write a JUMP at the end of the old segment to link it. A recording with none yet starts in the new segment
-// (its first record is its handle), and the bytes at the old write position are not its own: after an END that took the last bytes there is no room there at all
+static void ctl_chunk_close(cmd_t *o);
+// New segment: records already written in the old segment become one CTL_CHUNK (closed here). Nothing is written past the last record, so a slot sized from
+// GetCommandMemoryUsed is not overlapped by a JUMP (Tears of the Kingdom issue #61).
 static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
     uint8_t *start = align8(mem), *end = mem + n;
-    if (o->recording == 1 && o->cur) { if (cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); } put_hdr(o->cur, OP_JUMP, 16); memcpy(o->cur + 8, &start, 8);
-        o->used += 16; }   // the JUMP also occupies guest memory of this recording: count it in used, so the game packing the next recording right behind by used does not overwrite it
+    if (o->recording == 1 && o->cur && cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); }
+    if (o->recording) ctl_chunk_close(o);
     o->cur = start; o->end = end;
 }
 // Host-supplied segment when the game's own command memory runs out: when the game's out-of-memory callback cannot allocate from its command memory pool, it calls AddCommandMemory with an empty pool (p = NULL, n = 0)
@@ -828,14 +836,18 @@ uint64_t dm_nvn_frame_count(void);
 typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t sz; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
 static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
-// Take a segment of sz bytes: origin = the current recording's guest bytes [BEGIN, end of JUMP); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
+// Host-storage recordings keep their control list off the guest control bytes (those stay an anchor the game may scribble). One block per live anchor.
+typedef struct { uint8_t *data; uint32_t cap, used; uintptr_t org_lo, org_hi; int busy; } ctlhost_t;
+static ctlhost_t *g_ctlhost; static int g_nctlhost, g_capctlhost;
+static pthread_mutex_t g_ctlhost_mu = PTHREAD_MUTEX_INITIALIZER;
+// Take a segment of sz bytes: origin = the current recording's guest bytes [first record, write position); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
 static uint8_t *hostseg_take(const cmd_t *o, uint32_t sz) {
     static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL;
     uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;
     for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + g_hostseg[i].sz) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
-    if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
+    if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur > lo ? cur : lo + 1; }
     if (!in_seg && o && o->host_control && o->ctl_anchor) { lo = o->ctl_anchor; hi = lo + 16; }
     for (int i = 0; i < g_nhostseg && !m; i++)
         if (!g_hostseg[i].busy && g_hostseg[i].sz == sz) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, sz }; m = g_hostseg[i].mem; }
@@ -851,10 +863,53 @@ static uint8_t *hostseg_take(const cmd_t *o, uint32_t sz) {
     return m;
 }
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
+static void ctlhost_release(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_ctlhost_mu);
+    for (int i = 0; i < g_nctlhost; i++) if (g_ctlhost[i].busy && g_ctlhost[i].org_hi > lo && g_ctlhost[i].org_lo < hi) g_ctlhost[i].busy = 0;
+    pthread_mutex_unlock(&g_ctlhost_mu);
+}
+// A control-owned recording consumes one aligned 16-byte identity, even if its first replay record is larger than the entire control block. CPU records never overwrite the guest control layout.
+static void cmd_host_anchor(cmd_t *o) {
+    for (int tries = 0; tries < 3; tries++) {
+        size_t size = o->ctl_mem ? (size_t)(o->ctl_end - o->ctl_mem) : 0;
+        if (o->ctl_used <= size) {
+            uintptr_t p = ((uintptr_t)o->ctl_mem + o->ctl_used + 7) & ~(uintptr_t)7;
+            if (p && p <= (uintptr_t)o->ctl_end && (uintptr_t)o->ctl_end - p >= 16) { o->ctl_anchor = p; o->ctl_used = p + 16 - (uintptr_t)o->ctl_mem; return; }
+        }
+        if (!o->cb || tries == 2) return;   // no valid guest anchor: retain the existing conservative unknown-lifetime fallback
+        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, 16, o->cb_data);
+    }
+}
+// The open host list for this recording (matched by ctl_list), or a free block stamped with the anchor. Grows the entry storage. Returns the table index.
+static int ctlhost_open(cmd_t *o) {
+    if (!o->ctl_anchor) cmd_host_anchor(o);
+    uintptr_t lo = o->ctl_anchor, hi = lo ? lo + 16 : 0;
+    pthread_mutex_lock(&g_ctlhost_mu);
+    int idx = -1;
+    if (o->ctl_list) for (int i = 0; i < g_nctlhost; i++) if (g_ctlhost[i].busy && g_ctlhost[i].data == o->ctl_list) { idx = i; break; }
+    if (idx < 0) {
+        for (int i = 0; i < g_nctlhost; i++) if (!g_ctlhost[i].busy) {
+            idx = i; g_ctlhost[i].busy = 1; g_ctlhost[i].used = 0; g_ctlhost[i].org_lo = lo; g_ctlhost[i].org_hi = hi; break;
+        }
+    }
+    if (idx < 0) {
+        if (g_nctlhost == g_capctlhost) { g_capctlhost = g_capctlhost ? g_capctlhost * 2 : 64; g_ctlhost = realloc(g_ctlhost, sizeof *g_ctlhost * (size_t)g_capctlhost); }
+        idx = g_nctlhost++; g_ctlhost[idx] = (ctlhost_t){ NULL, 0, 0, lo, hi, 1 };
+    }
+    if (g_ctlhost[idx].used + 8 > g_ctlhost[idx].cap) {
+        uint32_t cap = g_ctlhost[idx].cap ? g_ctlhost[idx].cap * 2 : 64;
+        uint8_t *data = realloc(g_ctlhost[idx].data, cap);
+        g_ctlhost[idx].data = data; g_ctlhost[idx].cap = cap;
+        if (o->ctl_list) o->ctl_list = data;
+    }
+    pthread_mutex_unlock(&g_ctlhost_mu);
+    return idx;
+}
 static void hostseg_release(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_hostseg_mu);
     for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) g_hostseg[i].busy = 0;
     pthread_mutex_unlock(&g_hostseg_mu);
+    ctlhost_release(lo, hi);
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p; cmd_t *o = CB(c);
@@ -879,64 +934,116 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
     cmd_t *o = CB(c); if (!m || n < 16) return;
     hostseg_release((uintptr_t)m, (uintptr_t)m + n);
+    // A guest list that is still open keeps a LINK in the old block so the handle (its first entry) reaches the new block. Host-storage recordings do not write the guest bytes.
+    if (!o->host_control && o->ctl_list && o->ctl_mem && o->ctl_used + 8 <= (uint64_t)(o->ctl_end - o->ctl_mem)) {
+        uint64_t link = ctl_e(CTL_LINK, m, 0); memcpy(o->ctl_mem + o->ctl_used, &link, 8);
+    }
     o->ctl_mem = m; o->ctl_end = (uint8_t *)m + n; o->ctl_used = 0;
 }
-// A control-owned recording consumes one aligned 16-byte identity, even if its first replay record is larger than the entire control block. CPU records never overwrite the guest control layout.
-static void cmd_host_anchor(cmd_t *o) {
-    for (int tries = 0; tries < 3; tries++) {
-        size_t size = o->ctl_mem ? (size_t)(o->ctl_end - o->ctl_mem) : 0;
-        if (o->ctl_used <= size) {
-            uintptr_t p = ((uintptr_t)o->ctl_mem + o->ctl_used + 7) & ~(uintptr_t)7;
-            if (p && p <= (uintptr_t)o->ctl_end && (uintptr_t)o->ctl_end - p >= 16) { o->ctl_anchor = p; o->ctl_used = p + 16 - (uintptr_t)o->ctl_mem; return; }
-        }
-        if (!o->cb || tries == 2) return;   // no valid guest anchor: retain the existing conservative unknown-lifetime fallback
-        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, 16, o->cb_data);
-    }
+static void ctl_host_put(cmd_t *o, uint64_t e) {
+    int idx = ctlhost_open(o);
+    pthread_mutex_lock(&g_ctlhost_mu);
+    ctlhost_t *b = &g_ctlhost[idx];
+    memcpy(b->data + b->used, &e, 8); b->used += 8;
+    if (!o->ctl_list) o->ctl_list = b->data;
+    pthread_mutex_unlock(&g_ctlhost_mu);
 }
-// Get space for one record and keep `keep` bytes after it (OP_RESERVE, 0 for the END); if not enough, call back into the game per the NVN convention to add command memory
-static uint8_t *cmd_alloc_keep(cmd_t *o, uint32_t size, uint32_t keep) {
+// One control entry. Host-storage recordings keep it off the guest anchor; a real command pool writes it into the guest control block.
+static void ctl_put(cmd_t *o, uint64_t e) {
+    if (o->host_control) { ctl_host_put(o, e); return; }
+    uint32_t need = (e & CTL_LAST) ? 8u : 16u;
+    for (int tries = 0; !o->ctl_mem || o->ctl_used + need > (uint64_t)(o->ctl_end - o->ctl_mem); tries++) {
+        if (!o->cb || tries == 2) { ctl_host_put(o, e); return; }
+        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, need, o->cb_data);
+    }
+    uint8_t *p = o->ctl_mem + o->ctl_used; memcpy(p, &e, 8); o->ctl_used += 8;
+    if (!o->ctl_list) o->ctl_list = p;
+}
+static void ctl_push(cmd_t *o, uint64_t e) {
+    if (o->ctl_q[1]) { ctl_put(o, o->ctl_q[0]); o->ctl_q[0] = o->ctl_q[1]; o->ctl_q[1] = 0; }
+    o->ctl_q[o->ctl_q[0] ? 1 : 0] = e;
+}
+static void ctl_flush(cmd_t *o) { if (o->ctl_q[1]) { ctl_put(o, o->ctl_q[0]); o->ctl_q[0] = o->ctl_q[1]; o->ctl_q[1] = 0; } }
+static void ctl_chunk_close(cmd_t *o) {
+    if (o->chunk && o->cur > o->chunk) ctl_push(o, ctl_e(CTL_CHUNK, o->chunk, (uint64_t)(o->cur - o->chunk)));
+    o->chunk = NULL;
+}
+typedef struct { const uint8_t *e; int done; } ctl_iter;
+static int ctl_next(ctl_iter *it, uint64_t *out) {
+    for (int links = 0; !it->done && links < 1024; links++) {
+        uint64_t v; memcpy(&v, it->e, 8);
+        if (ctl_kind(v) == CTL_LINK) { it->e = ctl_addr(v); if (!it->e) { it->done = 1; return 0; } continue; }
+        if (ctl_kind(v) != CTL_CHUNK) { it->done = 1; return 0; }
+        it->e += 8; it->done = !!(v & CTL_LAST); *out = v & ~CTL_LAST; return 1;
+    }
+    it->done = 1; return 0;
+}
+// Get space for one record. The record joins the open control-list piece; a segment switch closes the piece instead of writing a JUMP.
+static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     size = (size + 7) & ~7u;
     if (o->host_control && o->recording == 2 && !o->cur) {
-        cmd_host_anchor(o); uint32_t sz = o->host_sz ? o->host_sz : HOSTSEG_MIN; while (sz < size + keep && sz < HOSTSEG_SZ) sz <<= 1;
+        cmd_host_anchor(o); uint32_t sz = o->host_sz ? o->host_sz : HOSTSEG_MIN; while (sz < size && sz < HOSTSEG_SZ) sz <<= 1;
         cmd_new_segment(o, hostseg_take(o, sz), sz);
     }
-    for (int tries = 0; !o->cur || o->cur + size + keep > o->end; tries++) {
-        // The game's callback cannot supply enough (newer-SDK games hand out small chunks sized for real-device commands, or disable the callback and manage memory themselves): continue recording in a host segment instead of aborting
+    for (int tries = 0; !o->cur || o->cur + size > o->end; tries++) {
         if (!o->cb || tries == 2) {
-            static int once; if (!once++) LOG("[nvn] command memory: the game's callback did not add enough (cb=%p, need %u bytes), using a host-lent segment", (void *)o->cb, size + keep);
-            uint32_t sz = o->host_control ? HOSTSEG_MIN : HOSTSEG_SZ; while (sz < size + keep && sz < HOSTSEG_SZ) sz <<= 1;
+            static int once; if (!once++) LOG("[nvn] command memory: the game's callback did not add enough (cb=%p, need %u bytes), using a host-lent segment", (void *)o->cb, size);
+            uint32_t sz = o->host_control ? HOSTSEG_MIN : HOSTSEG_SZ; while (sz < size && sz < HOSTSEG_SZ) sz <<= 1;
             cmd_new_segment(o, hostseg_take(o, sz), sz); break;
         }
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
         { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ncb;
-          if (cblog && (++ncb <= 40 || ncb % 1000 == 0)) LOG("[nvn] command memory callback #%llu cmd=%p need %u (used in this segment %ld)", (unsigned long long)ncb, (void *)o, size + keep, o->cur && o->end ? (long)(o->cur - (o->end - 1)) : -1L); }
-        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + keep, o->cb_data);
+          if (cblog && (++ncb <= 40 || ncb % 1000 == 0)) LOG("[nvn] command memory callback #%llu cmd=%p need %u (used in this segment %ld)", (unsigned long long)ncb, (void *)o, size, o->cur && o->end ? (long)(o->cur - (o->end - 1)) : -1L); }
+        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size, o->cb_data);
     }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
     uint8_t *p = o->cur; o->cur += size; o->used += size; put_hdr(p, 0, size);
-    if (o->recording == 2) { o->begin = p; o->recording = 1; }   // The recording's first record is its handle
+    if (o->recording == 2) { o->begin = p; o->recording = 1; }
+    if (o->recording) {
+        if (o->chunk && (uint64_t)(o->cur - o->chunk) > CTL_CHUNK_MAX) { if (p > o->chunk) ctl_push(o, ctl_e(CTL_CHUNK, o->chunk, (uint64_t)(p - o->chunk))); o->chunk = NULL; }
+        if (size > CTL_CHUNK_MAX) ctl_push(o, ctl_e(CTL_CHUNK, p, CTL_ONE));
+        else if (!o->chunk) o->chunk = p;
+        ctl_flush(o);
+    }
     return p;
 }
-static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) { return cmd_alloc_keep(o, size, OP_RESERVE); }
-// A recording starts with its first command, as in NVN: no BEGIN record, so an empty recording takes only its END. Games size command memory by GetCommandMemoryUsed
-// (nvn_obj.h draw_rec): Breath of the Wild sums one scratch recording per mesh and per shape and render pass into each model's prerecorded commands, and with an
-// 8-byte BEGIN on each of several hundred recordings a model came out a 4 KB page over its resource size table entry
+// A recording starts with its first command, as in NVN: no BEGIN record, and an empty recording takes no command memory. Games size command memory by GetCommandMemoryUsed
+// (nvn_obj.h draw_rec): Breath of the Wild sums one scratch recording per mesh and per shape and render pass into each model's prerecorded commands.
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("[RED] BeginRecording re-entered");
     // Each control-owned recording needs its own host chain and guest anchor. Multiple cached handles must not share an overflow segment reclaimed by just one handle's control range.
     if (!o->recording && o->host_control) { o->cur = o->end = NULL; o->ctl_anchor = 0; }
     o->recording = 2;   // 2: recording, no command yet (cmd_alloc sets begin)
+    o->chunk = NULL; o->ctl_list = NULL; o->ctl_q[0] = o->ctl_q[1] = 0;
 }
+// The handle is the control list's first entry. No OP_END is written into command memory.
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
-    uint8_t *p = cmd_alloc_keep(o, 8, 0); put_hdr(p, OP_END, 8);   // nothing follows: the END may take the segment's last bytes
-    o->recording = 0;
-    return (NVNcommandHandle)o->begin;
+    if (o->host_control && !o->ctl_anchor) cmd_host_anchor(o);
+    ctl_chunk_close(o);
+    if (!o->ctl_q[0]) o->ctl_q[0] = ctl_e(CTL_CHUNK, NULL, 0);
+    ctl_flush(o); ctl_put(o, o->ctl_q[0] | CTL_LAST); o->ctl_q[0] = 0;
+    uint8_t *h = o->ctl_list; o->ctl_list = NULL; o->chunk = NULL; o->recording = 0;
+    return (NVNcommandHandle)h;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
+// CopyCommands copies the source records into this command memory (the source may be recorded over). The bytes copied are the records only.
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
-    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+    cmd_t *o = CB(c);
+    for (int i = 0; i < n; i++) {
+        if (!nvn_handle_is_list((void *)(uintptr_t)h[i])) continue;
+        ctl_iter it = { (const uint8_t *)(uintptr_t)h[i], 0 }; uint64_t v;
+        while (ctl_next(&it, &v)) {
+            const uint8_t *p = ctl_addr(v), *pe = p + ctl_chunk_bytes(v);
+            if (!p) continue;
+            while (p < pe) {
+                op_hdr r; memcpy(&r, p, sizeof r);
+                if (r.size < 8 || (r.size & 7) || p + r.size > pe) break;
+                uint8_t *d = cmd_alloc(o, r.size); memcpy(d, p, r.size); p += r.size;
+            }
+        }
+    }
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
@@ -979,9 +1086,121 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
 // Binding records with arrays are allocated by the actual count: prefix fields + n elements (the replay side reads only the first n). Previously they were recorded at fixed length for the maximum count (bind vertex buffers 272 bytes, bind textures / samplers 280 bytes,
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
 #define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
-// Draws carry the indirect / multi-draw fields (ind onwards) only when they use them: a plain indexed draw record is 0x28 bytes instead of 0x40 (nvn_obj.h draw_rec)
-static void rec_draw(NVNcommandBuffer *c, p_draw d) { size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
-static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) { size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
+// Compact records (nvn_obj.h OPC_*): mesh draws, vertex buffers and uniform buffers in fewer command bytes than the canonical record. Replay expands them.
+static int g_rec_compact = 1;
+static uint8_t *crec(NVNcommandBuffer *c, uint32_t opc, uint32_t args, size_t payload) {
+    uint32_t sz = (uint32_t)((8 + payload + 7) & ~(size_t)7);
+    uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, opc | (args << 8), sz); memset(p + 8, 0, sz - 8);
+    return p + 8;
+}
+static void put32(uint8_t **q, uint32_t v) { memcpy(*q, &v, 4); *q += 4; }
+static void put64(uint8_t **q, uint64_t v) { memcpy(*q, &v, 8); *q += 8; }
+static uint32_t get32(const uint8_t **q) { uint32_t v; memcpy(&v, *q, 4); *q += 4; return v; }
+static uint64_t get64(const uint8_t **q) { uint64_t v; memcpy(&v, *q, 8); *q += 8; return v; }
+static uint8_t *xrec(uint8_t *out, size_t *n, uint32_t op, size_t payload) {
+    uint32_t sz = (uint32_t)((8 + payload + 7) & ~(size_t)7); uint8_t *p = out + *n;
+    if (*n + sz > REC_EXPAND_MAX) die("NVN compact record: its expansion exceeds REC_EXPAND_MAX");
+    op_hdr h = {op, sz}; memcpy(p, &h, 8); memset(p + 8, 0, sz - 8); *n += sz; return p + 8;
+}
+// Draws carry the indirect / multi-draw fields (ind onwards) only when they use them: a plain indexed draw record is 0x28 bytes instead of 0x40 (nvn_obj.h draw_rec).
+// The compact form of a plain draw is 16 bytes and of a plain indexed draw is 24, and neither is followed by an END in command memory.
+static void rec_draw(NVNcommandBuffer *c, p_draw d) {
+    if (g_rec_compact && !d.mdi_cnt && (uint32_t)d.prim < 0x100) {
+        uint8_t *q;
+        if (d.ind) { q = crec(c, OPC_DRAW_IND, (uint32_t)d.prim, 8); put64(&q, d.ind); return; }
+        if (d.instances == 1 && !d.base_instance) { q = crec(c, OPC_DRAW, (uint32_t)d.prim, 8); put32(&q, (uint32_t)d.first); put32(&q, (uint32_t)d.count); return; }
+        q = crec(c, OPC_DRAW_INST, (uint32_t)d.prim, 16); put32(&q, (uint32_t)d.first); put32(&q, (uint32_t)d.count); put32(&q, (uint32_t)d.base_instance); put32(&q, (uint32_t)d.instances); return;
+    }
+    size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n);
+}
+static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
+    if (g_rec_compact && !d.mdi_cnt && (uint32_t)d.prim < 0x100 && (uint32_t)d.itype < 0x100) {
+        uint32_t a = (uint32_t)d.prim | (uint32_t)d.itype << 8; uint8_t *q;
+        if (d.ind) { if (d.count || d.base_vertex || d.base_instance || d.instances != 1) goto full; q = crec(c, OPC_DRAW_IDX_IND, a, 16); put64(&q, d.ibuf); put64(&q, d.ind); return; }
+        if (d.instances == 1 && !d.base_instance) { q = crec(c, OPC_DRAW_IDX, a, 16); put32(&q, (uint32_t)d.count); put32(&q, (uint32_t)d.base_vertex); put64(&q, d.ibuf); return; }
+        q = crec(c, OPC_DRAW_IDX_INST, a, 24); put32(&q, (uint32_t)d.count); put32(&q, (uint32_t)d.base_vertex); put32(&q, (uint32_t)d.base_instance); put32(&q, (uint32_t)d.instances); put64(&q, d.ibuf); return;
+    }
+full:;
+    size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n);
+}
+// One uniform binding whose address is 256-byte aligned and whose size is below 2^18: 8 bytes after the header (16 total) instead of a 32-byte OP_BIND_UBO.
+static int rec_ubo(NVNcommandBuffer *c, int st, int index, NVNbufferAddress addr, size_t n) {
+    if (!g_rec_compact || (unsigned)st >= 6 || (unsigned)index >= 16 || (addr & 0xff) || addr >> 48 || n >= (1u << 18)) return 0;
+    uint8_t *q = crec(c, OPC_UBO, (uint32_t)st | (uint32_t)index << 3 | 1u << 7, 8);
+    put64(&q, addr >> 8 | (uint64_t)n << 40);
+    return 1;
+}
+size_t nvn_rec_expand(const uint8_t *rec_, uint8_t *out) {
+    op_hdr h; memcpy(&h, rec_, 8); uint32_t a = h.op >> 8; const uint8_t *q = rec_ + 8; size_t n = 0;
+    switch (h.op & 0xff) {
+    case OPC_DRAW: case OPC_DRAW_INST: case OPC_DRAW_IND: {
+        p_draw d = { .prim = (int32_t)(a & 0xff), .instances = 1 };
+        if ((h.op & 0xff) == OPC_DRAW_IND) d.ind = get64(&q);
+        else { d.first = (int32_t)get32(&q); d.count = (int32_t)get32(&q); if ((h.op & 0xff) == OPC_DRAW_INST) { d.base_instance = (int32_t)get32(&q); d.instances = (int32_t)get32(&q); } }
+        size_t k = d.ind ? sizeof d : offsetof(p_draw, ind); memcpy(xrec(out, &n, OP_DRAW, k), &d, k); break; }
+    case OPC_DRAW_IDX: case OPC_DRAW_IDX_INST: case OPC_DRAW_IDX_IND: {
+        p_draw_idx d = { .prim = (int32_t)(a & 0xff), .itype = (int32_t)(a >> 8 & 0xff), .instances = 1 };
+        if ((h.op & 0xff) == OPC_DRAW_IDX_IND) { d.ibuf = get64(&q); d.ind = get64(&q); }
+        else { d.count = (int32_t)get32(&q); d.base_vertex = (int32_t)get32(&q); if ((h.op & 0xff) == OPC_DRAW_IDX_INST) { d.base_instance = (int32_t)get32(&q); d.instances = (int32_t)get32(&q); } d.ibuf = get64(&q); }
+        size_t k = d.ind ? sizeof d : offsetof(p_draw_idx, ind); memcpy(xrec(out, &n, OP_DRAW_IDX, k), &d, k); break; }
+    case OPC_VBUFS: {
+        int cnt = (int)(a >> 8 & 0xff);
+        p_bind_vbuf *r = (p_bind_vbuf *)xrec(out, &n, OP_BIND_VBUF, offsetof(p_bind_vbuf, r) + sizeof(NVNbufferRange) * (size_t)cnt); r->first = (int32_t)(a & 0xff); r->n = cnt;
+        for (int i = 0; i < cnt; i++) { r->r[i].address = get64(&q); r->r[i].size = get32(&q); }
+        break; }
+    case OPC_UBO: {
+        uint32_t st = a & 7, first = a >> 3 & 0xf, cnt = a >> 7 & 0x1f;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint64_t v = get64(&q);
+            p_bind_buf b = { (int32_t)st, (int32_t)(first + i), (v & ((UINT64_C(1) << 40) - 1)) << 8, v >> 40 };
+            memcpy(xrec(out, &n, OP_BIND_UBO, sizeof b), &b, sizeof b);
+        }
+        break; }
+    default: die("NVN command list: unknown compact record %#x", h.op);
+    }
+    return n;
+}
+int nvn_walk_records(const uint8_t *handle, void (*fn)(const uint8_t *start, const uint8_t *end, void *ctx), void *ctx) {
+    if (!nvn_handle_is_list(handle) || !fn) return 0;
+    ctl_iter it = { handle, 0 }; uint64_t v;
+    while (ctl_next(&it, &v)) {
+        const uint8_t *q = ctl_addr(v); size_t nb = ctl_chunk_bytes(v);
+        if (!q || !nb) continue;
+        const uint8_t *qe = q + nb;
+        while (q < qe) {
+            op_hdr hd; memcpy(&hd, q, sizeof hd);
+            if (hd.size < 8 || (hd.size & 7) || q + hd.size > qe) return 1;
+            if (rec_compact(hd.op)) {
+                uint8_t x[REC_EXPAND_MAX] __attribute__((aligned(8))); size_t m = nvn_rec_expand(q, x); fn(x, x + m, ctx);
+            } else fn(q, q + hd.size, ctx);
+            q += hd.size;
+        }
+    }
+    return 1;
+}
+uint8_t *nvn_rec_linear(uint64_t handle, size_t *len) {
+    size_t n = 0, cap = 4096; uint8_t *buf = malloc(cap);
+    if (!buf) die("NVN command list: out of memory for a linear copy");
+    if (!nvn_handle_is_list((void *)(uintptr_t)handle)) { free(buf); if (len) *len = 0; return NULL; }
+    ctl_iter it = { (const uint8_t *)(uintptr_t)handle, 0 }; uint64_t v;
+    while (ctl_next(&it, &v)) {
+        const uint8_t *q = ctl_addr(v); size_t nb = ctl_chunk_bytes(v);
+        if (!q || !nb) continue;
+        const uint8_t *qe = q + nb;
+        while (q < qe) {
+            op_hdr hd; memcpy(&hd, q, sizeof hd);
+            if (hd.size < 8 || (hd.size & 7) || q + hd.size > qe) break;
+            const uint8_t *src = q; size_t m = hd.size; uint8_t x[REC_EXPAND_MAX] __attribute__((aligned(8)));
+            if (rec_compact(hd.op)) { m = nvn_rec_expand(q, x); src = x; }
+            if (n + m + 8 > cap) { uint8_t *nb_ = realloc(buf, cap = (n + m + 8) * 2); if (!nb_) die("NVN command list: out of memory for a linear copy"); buf = nb_; }
+            memcpy(buf + n, src, m); n += m; q += hd.size;
+        }
+    }
+    if (n + 8 > cap) { uint8_t *nb_ = realloc(buf, n + 8); if (!nb_) die("NVN command list: out of memory for a linear copy"); buf = nb_; }
+    put_hdr(buf + n, OP_END, 8); n += 8;
+    if (len) *len = n;
+    return buf;
+}
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 // Records with textures snapshot the texture objects (0x80 bytes each, after the record struct) and replay reads the snapshots: an NVN command no longer depends on the API object once recorded, and the game may finalize, free or reuse it before submitting.
 // Unity (Engage) does so when it changes scenes; only the object pointer used to be recorded, and replay read other data (a texture 1869367126 high, a Metal assertion abort).
@@ -1058,9 +1277,12 @@ NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, con
 }
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
     if (n < 0 || first + n > 16) { LOG("[RED] BindVertexBuffers first=%d n=%d", first, n); return; }
+    int fit = g_rec_compact && first >= 0 && n > 0; for (int i = 0; i < n && fit; i++) fit = rg[i].size <= UINT32_MAX;
+    if (fit) { uint8_t *q = crec(c, OPC_VBUFS, (uint32_t)first | (uint32_t)n << 8, 12 * (size_t)n); for (int i = 0; i < n; i++) { put64(&q, rg[i].address); put32(&q, (uint32_t)rg[i].size); } return; }
     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    if (rec_ubo(c, st, i, a, n)) return;
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
@@ -1355,6 +1577,35 @@ static void replay_unlock(void) { if (nvn_async()) pthread_mutex_unlock(&g_sub_m
 // scenes: the replay read overwritten records, "unknown record op", and drew nothing while the sound went on). So each submitted handle is copied whole when it
 // is submitted: JUMPs followed, CALLs inlined, and the pointers a record keeps to its own texture snapshots (tex_snap) moved with it. out NULL: only the size
 static size_t rec_flat(const uint8_t *p, uint8_t *out, size_t at, size_t cap, int depth) {
+    if (nvn_handle_is_list(p)) {
+        ctl_iter it = { p, 0 }; uint64_t v;
+        while (ctl_next(&it, &v)) {
+            const uint8_t *q = ctl_addr(v); size_t nb = ctl_chunk_bytes(v);
+            if (!q || !nb) continue;
+            const uint8_t *qe = q + nb;
+            while (q < qe) {
+                op_hdr hd; memcpy(&hd, q, sizeof hd);
+                if (hd.size < 8 || (hd.size & 7) || q + hd.size > qe) return at;
+                if (rec_compact(hd.op)) {
+                    uint8_t x[REC_EXPAND_MAX] __attribute__((aligned(8))); size_t m = nvn_rec_expand(q, x);
+                    if (out) { if (at + m > cap) return at; memcpy(out + at, x, m); }
+                    at += m;
+                } else if (hd.op == OP_CALL && depth < 8) {
+                    uint64_t t; memcpy(&t, q + 8, 8); at = rec_flat((const uint8_t *)(uintptr_t)t, out, at, cap, depth + 1);
+                } else {
+                    if (out) {
+                        if (at + hd.size > cap) return at;
+                        uint8_t *d = out + at; memcpy(d, q, hd.size);
+                        for (uint32_t k = 8; k + 8 <= hd.size; k += 8) { uint64_t w; memcpy(&w, d + k, 8);
+                            if (w >= (uintptr_t)q && w < (uintptr_t)q + hd.size) { w += (uintptr_t)d - (uintptr_t)q; memcpy(d + k, &w, 8); } }
+                    }
+                    at += hd.size;
+                }
+                q += hd.size;
+            }
+        }
+        return at;
+    }
     for (;;) {
         op_hdr hd; memcpy(&hd, p, sizeof hd);
         if (hd.op == OP_END) return at;
@@ -1566,6 +1817,10 @@ static void dump_frame(void) {
         const char *t = getenv("DM_NVN_TSV"); if (t && !(g_tsv = fopen(t, "w"))) LOG("[RED] cannot open %s", t);
         if (g_tsv) fprintf(g_tsv, "# kind: nvn-per-frame  value = call count when name is an NVN function name; names starting with @ are timing probes (ms / count)\nframe\tname\tvalue\n");
     }
+    if (!nvn_counting()) {   // the per-slot walk is itself per-frame work; skip it when the thunks are not counting
+        if (!g_frame) LOG("[nvn] call counts off (DM_NVN_COUNT=1 turns them on)");
+        g_frame++; cs_dump(); goto counts_done;
+    }
     uint64_t total = 0; unsigned nfn = 0;
     char line[8192]; size_t o = 0; line[0] = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++) {
@@ -1580,6 +1835,7 @@ static void dump_frame(void) {
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu: %u functions %llu calls |%s", g_frame ? "frame" : "init", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
     g_frame++; cs_dump();
+counts_done:
     // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
@@ -2477,7 +2733,17 @@ NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const sha
 // Singular / combined forms → plural / separate forms; state the replay layer does not have yet (conditional render, depth bounds, ...) is logged once and drawing continues (better to over-draw than to drop).
 #include "../tex/nvn_deswizzle.h"
 
-NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) { h_nvnCommandBufferCopyCommands(c, n, h); }   // the replay layer treats CALL and COPY alike
+// CallCommands splices the called list's pieces into this recording. It takes no command memory; the called command memory must stay until this recording runs.
+NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
+    cmd_t *o = CB(c);
+    if (!o->recording) { LOG("[RED] CallCommands outside a recording"); return; }
+    for (int i = 0; i < n; i++) {
+        if (!nvn_handle_is_list((void *)(uintptr_t)h[i])) continue;
+        ctl_chunk_close(o);
+        ctl_iter it = { (const uint8_t *)(uintptr_t)h[i], 0 }; uint64_t v;
+        while (ctl_next(&it, &v)) if (ctl_len(v)) { ctl_push(o, v); ctl_flush(o); }
+    }
+}
 // Combined texture handle (texture id | sampler id << 20) is recorded into the texture slot as is: the replay layer takes the texture from the low 20 bits and the sampler from the high bits (nvn_mtl.m NVN_RB_SAMPT)
 // One combined handle: recorded as the hardware lays the command out, the handle 16 bytes in, where Luigi's Mansion 3 patches it after recording (nvn_obj.h p_bind_tex1)
 NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {

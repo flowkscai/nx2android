@@ -86,10 +86,13 @@ typedef struct {
     uint64_t used;                       // Bytes written since the game last added command memory, across recordings and host segments, including segment-switch JUMPs (returned by GetCommandMemoryUsed)
     int32_t tex_base, samp_base;         // Host-table bases of the texture / sampler pool this command buffer last bound (hle_nvn.c dpool_add; 0 = the first pool of its kind)
     size_t cmd_size;                     // GetCommandMemorySize: the byte count the game last passed to AddCommandMemory with a pool (records and host-lent segments leave it)
-    uint8_t *ctl_mem, *ctl_end;           // Guest control storage owns handles even when there is no GPU command pool
-    uint64_t ctl_used;                   // Bytes reserved for lifetime anchors in the last control grant
-    uintptr_t ctl_anchor;                // This recording's reserved control bytes; CPU replay records stay in host storage
+    uint8_t *ctl_mem, *ctl_end;           // Guest control storage. A real command pool's recording list is written here; an empty pool keeps these bytes as a lifetime anchor
+    uint64_t ctl_used;                   // Bytes of that block reserved: list entries, or the 16-byte anchor when the records live in host storage
+    uintptr_t ctl_anchor;                // Host-storage recording's reserved guest control bytes (0 when the list itself is in guest control memory)
     uint32_t host_control, host_sz;       // Empty GPU command pool with control-owned host storage; initial segment size
+    uint64_t ctl_q[2];                   // Control entries not written yet (0 = none). The last waits until the next entry or EndRecording sets CTL_LAST
+    uint8_t *ctl_list;                   // First control entry of the open recording: the handle (NULL before the first entry is written)
+    uint8_t *chunk;                      // Start of the open piece of command records not yet pushed as a CTL_CHUNK (NULL = none)
 } cmd_t;                                                                                   FITS(cmd_t, NVNcommandBuffer);
 
 // ---------- State objects (defaults follow the NVN / GL defaults) ----------
@@ -109,6 +112,37 @@ typedef struct { uint32_t stride, divisor; } vs_st;                             
 
 // ---------- Command records: {op, size (including header, aligned to 8)} + payload ----------
 typedef struct { uint32_t op, size; } op_hdr;
+// A recording's control list, 8-byte entries. The handle is the first entry. Command memory holds only the records: the end of a recording,
+// the link to its next piece, and a call of another recording take no command bytes, so they take none of what GetCommandMemoryUsed reports.
+//   bits 63-62 kind: CTL_CHUNK records at addr, len bytes; CTL_LINK the list continues at addr. Kinds 0 and 2 are never written.
+//   bit 61 CTL_LAST: the list ends after this entry (not on a LINK). bits 60-44 len/8 (CTL_ONE = one record, as long as its header says).
+//   bits 43-0 addr/8 (8-aligned, below 2^47).
+enum { CTL_CHUNK = 1, CTL_LINK = 3 };
+#define CTL_LAST (UINT64_C(1) << 61)
+#define CTL_ONE (((UINT64_C(1) << 17) - 1) * 8)
+#define CTL_CHUNK_MAX (CTL_ONE - 8)
+static inline uint64_t ctl_e(unsigned kind, const void *addr, uint64_t len) { return (uint64_t)kind << 62 | (len >> 3) << 44 | (uint64_t)(uintptr_t)addr >> 3; }
+static inline unsigned ctl_kind(uint64_t e) { return (unsigned)(e >> 62); }
+static inline const uint8_t *ctl_addr(uint64_t e) { return (const uint8_t *)(uintptr_t)((e & ((UINT64_C(1) << 44) - 1)) << 3); }
+static inline uint64_t ctl_len(uint64_t e) { return (e >> 44 & ((UINT64_C(1) << 17) - 1)) << 3; }
+static inline size_t ctl_chunk_bytes(uint64_t e) { uint64_t n = ctl_len(e); if (n == CTL_ONE) { op_hdr h; memcpy(&h, ctl_addr(e), sizeof h); n = h.size; } return (size_t)n; }
+static inline int nvn_handle_is_list(const void *p) {
+    uint64_t v;
+    if (!p || ((uintptr_t)p & 7)) return 0;
+    memcpy(&v, p, 8);
+    return ctl_kind(v) == CTL_CHUNK || ctl_kind(v) == CTL_LINK;
+}
+// Compact records live only in command memory. Replay expands them (nvn_rec_expand) into the canonical OP_* records below. Header: OPC_* in the low 8 bits, small arguments in the upper 24.
+enum {
+    OPC_BASE = 0x80,
+    OPC_DRAW = OPC_BASE, OPC_DRAW_INST, OPC_DRAW_IND, OPC_DRAW_IDX, OPC_DRAW_IDX_INST, OPC_DRAW_IDX_IND,
+    OPC_VBUFS, OPC_UBO
+};
+#define REC_EXPAND_MAX 4096
+static inline int rec_compact(uint32_t op) { return (op & 0xff) >= OPC_BASE; }
+size_t nvn_rec_expand(const uint8_t *rec, uint8_t *out);
+int nvn_walk_records(const uint8_t *handle, void (*fn)(const uint8_t *start, const uint8_t *end, void *ctx), void *ctx);
+uint8_t *nvn_rec_linear(uint64_t handle, size_t *len);
 enum {
     OP_END, OP_JUMP, OP_BEGIN, OP_CALL,                                             // OP_BEGIN is no longer recorded (hle_nvn.c BeginRecording)
     OP_SIGNAL_EVENT, OP_REPORT_COUNTER, OP_COPY_B2B, OP_UPDATE_UB,                 // CPU-visible side effects

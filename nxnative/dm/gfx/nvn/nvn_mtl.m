@@ -7559,6 +7559,7 @@ static void clear_ds_tri(const p_clear_ds *c) {
 }
 
 void mtl_exec(const uint8_t *p) {
+    if (nvn_handle_is_list(p)) { size_t n = 0; uint8_t *lin = nvn_rec_linear((uint64_t)(uintptr_t)p, &n); if (lin) { mtl_exec(lin); free(lin); } return; }
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames

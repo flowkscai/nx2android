@@ -55,14 +55,21 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) { uint8_t *d = (uint
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post((post_op){2, NULL, 0, 0, addr, type}); }
 
-void mtl_exec(const uint8_t *p) {
-    for (;;) {
+static void exec_span(const uint8_t *p, const uint8_t *end);
+static void exec_on_span(const uint8_t *s, const uint8_t *e, void *ctx) { (void)ctx; exec_span(s, e); }
+static void exec_handle(const uint8_t *p) {
+    if (!nvn_walk_records(p, exec_on_span, NULL)) exec_span(p, NULL);
+}
+void mtl_exec(const uint8_t *p) { exec_handle(p); }
+static void exec_span(const uint8_t *p, const uint8_t *end) {
+    while (!end || p < end) {
         op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8) return;
         const uint8_t *a = p + 8;
         switch (h.op) {
         case OP_END: return;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_handle((const uint8_t *)(uintptr_t)t); break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); sync_replay_fence(s, g_fence + 1); break; }

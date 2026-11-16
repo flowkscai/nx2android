@@ -33,14 +33,25 @@ def harness():
 
     funcs = [
         'static uint8_t *align8(', 'static void put_hdr(',
+        'static void ctlhost_release(', 'static void cmd_host_anchor(', 'static int ctlhost_open(',
+        'static void ctl_host_put(', 'static void ctl_put(', 'static void ctl_push(', 'static void ctl_flush(',
+        'static void ctl_chunk_close(cmd_t *o) {',
         'static void cmd_new_segment(', 'static uint8_t *hostseg_take(', 'static void hostseg_release(',
         'NVN(nvnCommandBufferInitialize,', 'NVN(nvnCommandBufferFinalize,',
         'NVN(nvnCommandBufferAddCommandMemory,', 'NVN(nvnCommandBufferAddControlMemory,',
-        'static void cmd_host_anchor(', 'static uint8_t *cmd_alloc_keep(', 'static uint8_t *cmd_alloc(',
+        'static uint8_t *cmd_alloc(',
         'NVN(nvnCommandBufferBeginRecording,', 'NVN(nvnCommandBufferEndRecording,',
         'NVN(nvnCommandBufferGetCommandMemoryUsed,', 'NVN(nvnCommandBufferGetControlMemoryUsed,',
         'NVN(nvnCommandBufferGetControlMemorySize,', 'NVN(nvnCommandBufferGetControlMemoryFree,',
         'NVN(nvnCommandBufferGetCommandMemoryFree,', 'NVN(nvnCommandBufferGetCommandMemorySize,',
+        'static int ctl_next(',
+        'static void *rec(', 'static uint8_t *crec(',
+        'static void put32(', 'static void put64(', 'static uint32_t get32(', 'static uint64_t get64(',
+        'static uint8_t *xrec(', 'static void rec_draw(', 'static void rec_draw_idx(', 'static int rec_ubo(',
+        'size_t nvn_rec_expand(', 'int nvn_walk_records(',
+        'NVN(nvnCommandBufferBindVertexBuffers,', 'NVN(nvnCommandBufferBindUniformBuffer,',
+        'NVN(nvnCommandBufferDrawElementsInstanced,', 'NVN(nvnCommandBufferBindTexture,',
+        'NVN(nvnCommandBufferDrawElements,',
     ]
     pre = r'''
 #include <assert.h>
@@ -53,10 +64,14 @@ def harness():
 #define NVN(name, ret, ...) ret h_##name(__VA_ARGS__)
 #define CB(c) ((cmd_t *)(c))
 #define LOG(...) ((void)0)
-#define OP_RESERVE 16
 #define HOSTSEG_SZ (256u << 10)
 #define HOSTSEG_MIN (4u << 10)
 #define HOSTSEG_CAP (1u << 30)
+#define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
+#define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
+static int g_rec_compact = 1;
+static uint64_t mtl_samp_seq(void) { return 0; }
+typedef struct { const uint8_t *e; int done; } ctl_iter;
 static uint64_t dm_nvn_frame_count(void) { return 1000000; }
 static uint64_t now_ns(void) { return 0; }
 static void die(const char *fmt, ...) { (void)fmt; abort(); }
@@ -64,6 +79,14 @@ static int cs_on(void) { return 0; }
 static void cs_op(uint32_t op, uint32_t size) { (void)op; (void)size; }
 static struct { uint64_t waste, hostseg, grants, grant_bytes, grant_min, grant_max, cbs, bytes, recs; } g_cs;
 static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *chunk_of(NVNcommandHandle h) {
+    const uint8_t *list = (const uint8_t *)(uintptr_t)h;
+    assert(nvn_handle_is_list(list));
+    uint64_t e; memcpy(&e, list, 8);
+    assert(ctl_kind(e) == CTL_CHUNK);
+    const uint8_t *p = ctl_addr(e); assert(p);
+    return (uint8_t *)(uintptr_t)p;
+}
 '''
     globals_start = source.index('typedef struct { uint8_t *mem; uint64_t frame; int busy;')
     globals_end = source.index('// Take a segment of sz bytes:', globals_start)
@@ -73,7 +96,21 @@ static pthread_mutex_t g_cs_mu = PTHREAD_MUTEX_INITIALIZER;
     return pre + source[globals_start:globals_end] + '\n'.join(function(f) for f in funcs) + r'''
 static unsigned busy(void) { unsigned n=0; for (int i=0;i<g_nhostseg;i++) n+=g_hostseg[i].busy; return n; }
 static unsigned unknown(void) { unsigned n=0; for (int i=0;i<g_nhostseg;i++) n+=g_hostseg[i].busy && !g_hostseg[i].org_hi; return n; }
-static uint8_t *jump(uint8_t *p) { assert(((op_hdr *)p)->op==OP_JUMP); uint8_t *q; memcpy(&q,p+8,8); return q; }
+typedef struct { size_t bytes; int bad, draws, ends; } walk_t;
+static void on_span(const uint8_t *s, const uint8_t *e, void *ctx) {
+    walk_t *w = ctx;
+    while (s + 8 <= e) {
+        op_hdr h; memcpy(&h, s, 8);
+        if (h.size < 8 || s + h.size > e) { w->bad = 1; return; }
+        if (h.op == OP_JUMP || h.op == OP_CALL || (h.op == OP_END && h.size == 8)) w->ends = 1;
+        if (rec_compact(h.op)) w->bad = 1;
+        if (h.op == OP_DRAW_IDX) {
+            p_draw_idx tmp; const p_draw_idx *r = draw_idx_rec(s + 8, h.size, &tmp);
+            if (r->count == 3 && r->ibuf == 0x3000 && h.size == (uint32_t)(offsetof(p_draw_idx, ind) + 8)) w->draws++;
+        }
+        w->bytes += h.size; s += h.size;
+    }
+}
 static void start(NVNcommandBuffer *cb, void *ctl, size_t n) {
     h_nvnCommandBufferInitialize(cb,NULL); h_nvnCommandBufferAddControlMemory(cb,ctl,n);
     h_nvnCommandBufferAddCommandMemory(cb,NULL,0,512); h_nvnCommandBufferBeginRecording(cb);
@@ -87,23 +124,26 @@ int main(void) {
     memset(ctl,0xa7,sizeof ctl);
     start(&cb,ctl,512); assert(!g_nhostseg); uint8_t *p=cmd_alloc(CB(&cb),40); memset(p+8,0x42,32);
     NVNcommandHandle small=h_nvnCommandBufferEndRecording(&cb);
-    assert(small==(uintptr_t)p && small!=(uintptr_t)ctl && g_nhostseg==1 && unknown()==0);
-    assert(h_nvnCommandBufferGetCommandMemoryUsed(&cb)==48);
+    uint8_t *small_rec=chunk_of(small);
+    assert(small_rec==p && small!=(uintptr_t)p && small!=(uintptr_t)ctl && g_nhostseg==1 && unknown()==0);
+    assert(h_nvnCommandBufferGetCommandMemoryUsed(&cb)==40);
+    walk_t small_walk={0}; assert(nvn_walk_records((const uint8_t *)(uintptr_t)small, on_span, &small_walk));
+    assert(!small_walk.bad && !small_walk.ends && small_walk.bytes==40);
     assert(h_nvnCommandBufferGetCommandMemorySize(&cb)==0);
     assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==16);
     assert(h_nvnCommandBufferGetControlMemoryFree(&cb)==496);
     for (int i=0;i<512;i++) assert(ctl[i]==0xa7); // private replay records never overwrite guest control data
     // Finalizing/reinitializing the recorder must not free a cached handle.
     h_nvnCommandBufferFinalize(&cb); h_nvnCommandBufferInitialize(&cb,NULL);
-    assert(((uint8_t *)(uintptr_t)small)[8]==0x42);
+    assert(small_rec[8]==0x42);
     // Even a first record larger than the control block gets an independent host chain.
     start(&cb,ctl,64); p=cmd_alloc(CB(&cb),128); memset(p+8,0x51,120);
-    NVNcommandHandle first=h_nvnCommandBufferEndRecording(&cb); uint8_t *first_host=(uint8_t *)(uintptr_t)first;
-    assert(first!=(uintptr_t)ctl && first_host==p && busy()==1 && unknown()==0);
+    NVNcommandHandle first=h_nvnCommandBufferEndRecording(&cb); uint8_t *first_host=chunk_of(first);
+    assert(first!=(uintptr_t)ctl && first!=(uintptr_t)p && first_host==p && busy()==1 && unknown()==0);
     assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==16);
     // Another recording in the same control block gets a distinct anchor and segment.
     h_nvnCommandBufferBeginRecording(&cb); p=cmd_alloc(CB(&cb),128); memset(p+8,0x62,120);
-    NVNcommandHandle second=h_nvnCommandBufferEndRecording(&cb); uint8_t *second_host=(uint8_t *)(uintptr_t)second;
+    NVNcommandHandle second=h_nvnCommandBufferEndRecording(&cb); uint8_t *second_host=chunk_of(second);
     assert(second!=(uintptr_t)(ctl+16) && second_host!=first_host && busy()==2);
     assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==32);
     // Adjacent ranges and unrelated grants cannot invalidate either cached stream.
@@ -122,15 +162,46 @@ int main(void) {
     CB(&cb)->cb=control_callback; CB(&cb)->cb_data=replacement+256;
     h_nvnCommandBufferBeginRecording(&cb); p=cmd_alloc(CB(&cb),128);
     NVNcommandHandle callback_handle=h_nvnCommandBufferEndRecording(&cb);
-    assert(callback_handle==(uintptr_t)p && callback_handle!=(uintptr_t)(replacement+256));
+    assert(chunk_of(callback_handle)==p && callback_handle!=(uintptr_t)p && callback_handle!=(uintptr_t)(replacement+256));
     assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==16);
-    // Existing guest command-memory accounting and overflow remain command-backed.
+    // A 64-byte guest grant cannot hold two 40-byte records. The link and the end live in control memory, so command bytes are 80, not 40+JUMP+40+END.
     pool_t pool={.mem=guest,.size=sizeof guest};
     h_nvnCommandBufferInitialize(&cb,NULL); h_nvnCommandBufferAddControlMemory(&cb,ctl+512,512);
     h_nvnCommandBufferAddCommandMemory(&cb,(NVNmemoryPool *)&pool,0,64); h_nvnCommandBufferBeginRecording(&cb);
-    cmd_alloc(CB(&cb),40); cmd_alloc(CB(&cb),40); h_nvnCommandBufferEndRecording(&cb);
+    cmd_alloc(CB(&cb),40); cmd_alloc(CB(&cb),40);
+    NVNcommandHandle split=h_nvnCommandBufferEndRecording(&cb);
+    assert(h_nvnCommandBufferGetCommandMemoryUsed(&cb)==80);
+    assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==16);
+    walk_t split_walk={0}; assert(nvn_walk_records((const uint8_t *)(uintptr_t)split, on_span, &split_walk));
+    assert(!split_walk.bad && !split_walk.ends && split_walk.bytes==80);
+    // One mesh: vertex buffer, uniform, texture, indexed draw. Command memory is the records only (104), with no END.
+    _Alignas(8) uint8_t mesh_cmd[512]={0}, mesh_ctl[64]={0};
+    pool_t mesh_pool={.mem=mesh_cmd,.size=sizeof mesh_cmd};
+    h_nvnCommandBufferInitialize(&cb,NULL);
+    h_nvnCommandBufferAddControlMemory(&cb,mesh_ctl,sizeof mesh_ctl);
+    h_nvnCommandBufferAddCommandMemory(&cb,(NVNmemoryPool *)&mesh_pool,0,sizeof mesh_cmd);
+    h_nvnCommandBufferBeginRecording(&cb);
+    NVNbufferRange vr={.address=0x2000,.size=64};
+    h_nvnCommandBufferBindVertexBuffers(&cb,0,1,&vr);
+    h_nvnCommandBufferBindUniformBuffer(&cb,NVN_SHADER_STAGE_VERTEX,0,0x1000,256);
+    h_nvnCommandBufferBindTexture(&cb,NVN_SHADER_STAGE_FRAGMENT,0,(NVNtextureHandle)0x12345);
+    h_nvnCommandBufferDrawElements(&cb,NVN_DRAW_PRIMITIVE_TRIANGLES,NVN_INDEX_TYPE_UNSIGNED_SHORT,3,0x3000);
+    NVNcommandHandle mesh=h_nvnCommandBufferEndRecording(&cb);
     assert(h_nvnCommandBufferGetCommandMemoryUsed(&cb)==104);
-    assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==0);
+    assert(h_nvnCommandBufferGetControlMemoryUsed(&cb)==8);
+    uint8_t *raw=chunk_of(mesh);
+    static const uint32_t mesh_sizes[]={24,16,40,24}; uint32_t at=0; int saw_tex=0;
+    for (int i=0;i<4;i++) {
+        op_hdr rh; memcpy(&rh, raw+at, 8);
+        assert(rh.size==mesh_sizes[i]);
+        assert(rh.op!=OP_END && rh.op!=OP_JUMP && rh.op!=OP_CALL);
+        if (rh.op==OP_BIND_TEX1) { uint64_t hv; memcpy(&hv, raw+at+0x10, 8); assert(hv==0x12345); saw_tex=1; }
+        at+=rh.size;
+    }
+    assert(at==104 && saw_tex);
+    _Static_assert(offsetof(p_bind_tex1, h)==8, "texture handle stays 16 bytes into the record");
+    walk_t mesh_walk={0}; assert(nvn_walk_records((const uint8_t *)(uintptr_t)mesh, on_span, &mesh_walk));
+    assert(!mesh_walk.bad && !mesh_walk.ends && mesh_walk.draws==1);
     // Repeated same-range recordings stay bounded; frame age alone never reclaims.
     int capacity=g_nhostseg;
     for (int i=0;i<10000;i++) { start(&cb,ctl+768,64); cmd_alloc(CB(&cb),128); h_nvnCommandBufferEndRecording(&cb); }
@@ -205,7 +276,8 @@ int main(void) {
     assert(CB(cb)->host_control && h_nvnCommandBufferGetCommandMemorySize(cb)==64);
     h_nvnCommandBufferBeginRecording(cb); cmd_alloc(CB(cb),40); h_nvnCommandBufferEndRecording(cb);
     assert(h_nvnCommandBufferGetCommandMemorySize(cb)==64);
-    assert(h_nvnCommandBufferGetControlMemoryUsed(cb)==32);
+    // 16-byte anchor, 16 bytes of guest list for the overflowed recording, then another 16-byte anchor.
+    assert(h_nvnCommandBufferGetControlMemoryUsed(cb)==48);
     // A small real grant must publish its size before the host-segment fallback returns.
     h_nvnCommandBufferAddCommandMemory(cb,(NVNmemoryPool *)&pool,0,32);
     assert(h_nvnCommandBufferGetCommandMemorySize(cb)==32);
@@ -241,8 +313,8 @@ static void record_handles(NVNcommandBuffer *cb,uint8_t *control,NVNcommandHandl
         uint8_t *p=cmd_alloc(CB(cb),40); memset(p+8,(unsigned char)i,32);
         handles[i]=h_nvnCommandBufferEndRecording(cb);
         assert(h_nvnCommandBufferGetCommandMemorySize(cb)==0);
-        assert(h_nvnCommandBufferGetCommandMemoryUsed(cb)==48);
-        assert(h_nvnCommandBufferGetCommandMemoryFree(cb)==HOSTSEG_MIN-48);
+        assert(h_nvnCommandBufferGetCommandMemoryUsed(cb)==40);
+        assert(h_nvnCommandBufferGetCommandMemoryFree(cb)==HOSTSEG_MIN-40);
         assert(h_nvnCommandBufferGetControlMemorySize(cb)==16);
         assert(h_nvnCommandBufferGetControlMemoryUsed(cb)==16);
         assert(h_nvnCommandBufferGetControlMemoryFree(cb)==0);
@@ -263,7 +335,7 @@ int main(int argc,char **argv) {
     }
     record_handles(&cb,control,handles,n,grant);
     assert(g_nhostseg==n && g_hostseg_bytes==(uint64_t)n*HOSTSEG_MIN);
-    for(int i=0;i<n;i++) assert(((uint8_t *)(uintptr_t)handles[i])[8]==(unsigned char)i);
+    for(int i=0;i<n;i++) assert(chunk_of(handles[i])[8]==(unsigned char)i);
     assert(busy_segments()==(unsigned)n);
     if(!strcmp(argv[1],"reuse")) {
         uint64_t capacity=g_hostseg_bytes;
@@ -271,7 +343,7 @@ int main(int argc,char **argv) {
         h_nvnCommandBufferAddControlMemory(&cb,control,(size_t)n*16); assert(!busy_segments());
         record_handles(&cb,control,handles,n,grant);
         assert(g_nhostseg==n && g_hostseg_bytes==capacity);
-        for(int i=0;i<n;i++) assert(((uint8_t *)(uintptr_t)handles[i])[8]==(unsigned char)i);
+        for(int i=0;i<n;i++) assert(chunk_of(handles[i])[8]==(unsigned char)i);
     }
     printf("retained handles: %d, request: %zu, capacity: %llu, per handle: %u: PASS\n",
            n,grant,(unsigned long long)g_hostseg_bytes,HOSTSEG_MIN);
