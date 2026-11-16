@@ -20,3 +20,4 @@ status	playable
 tested	v458752 AYN Odin 2 (Snapdragon 8 Gen 2, Adreno 740, Android 13)
 package	org.nx2a.pokemonsword
 orientation	landscape
+sysdata	0100000000000811 0100000000000810 0100000000000814 0100000000000813 0100000000000812
