@@ -11,23 +11,46 @@ from porter import datapack
 from porter.adb import Adb, AdbError
 from porter.upstream import BuildError, say
 
-PREFIX = 'org.nx2a.'   # the packages ports install as (profile key package)
+PREFIX = 'org.nx2a.'   # a port's usual package. porter port --package installs under another name; that app is found by its data pack, not by this prefix.
 NAME_OK = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._ +()-]{0,62}$')
+PACKAGE = re.compile(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+')
 
 
 def saves_folder(package): return f'{datapack.files_folder(package)}/saves'
 
 
+def _packages(adb):
+    """Third-party packages installed on the device, in pm's order"""
+    out = adb.shell('pm list packages -3', check=False)
+    return [ln[len('package:'):].strip() for ln in out.splitlines() if ln.startswith('package:') and PACKAGE.fullmatch(ln[len('package:'):].strip())]
+
+
+def _with_data_pack(adb, packages):
+    """Which of packages have this port's data pack (files/nx2a-data.json). One shell test per batch: the directory listing of Android/data is hidden, a known file is not."""
+    found = set()
+    for i in range(0, len(packages), 40):
+        part = packages[i:i + 40]
+        script = 'for p in ' + ' '.join(shlex.quote(p) for p in part) + '; do '\
+                 f'[ -f /sdcard/Android/data/$p/files/{datapack.MANIFEST} ] && echo "$p"; done'
+        found.update(ln.strip() for ln in adb.shell(script, check=False).splitlines() if ln.strip() in part)
+    return found
+
+
 def apps(adb):
-    """The ported games installed on the device: [package]"""
-    out = adb.shell(f'pm list packages {PREFIX}', check=False)
-    return sorted(ln[len('package:'):].strip() for ln in out.splitlines() if ln.startswith('package:' + PREFIX))
+    """The ported games installed on the device: a package whose files folder holds nx2a-data.json (a port installed under another name), and any installed org.nx2a package. [package]"""
+    listed = _packages(adb)
+    marked = _with_data_pack(adb, [p for p in listed if not p.startswith(PREFIX)])   # the prefix does not need a file test: the app is a port even with no data pack left
+    return sorted(p for p in listed if p.startswith(PREFIX) or p in marked)
 
 
 def pick_app(adb, package=''):
+    """The app to use. An empty package is the only port apps() finds. A named package is used when it is that list, or when it is installed on the device."""
     have = apps(adb)
     if package:
-        if package not in have: raise BuildError(f'{package} is not installed on the device' + (f' (ported games there: {", ".join(have)})' if have else ''))
+        if package in have: return package
+        if not PACKAGE.fullmatch(package) or len(package) > 127: raise BuildError(f'not a package name: {package}')
+        if not adb.installed(package):
+            raise BuildError(f'{package} is not installed on the device' + (f' (ported games there: {", ".join(have)})' if have else ''))
         return package
     if len(have) == 1: return have[0]
     raise BuildError('no ported game is installed on the device' if not have else f'several ported games are installed: choose one with --package ({", ".join(have)})')
@@ -53,7 +76,7 @@ def _request(adb, package, file, lines, timeout=60):
     """Write saves/<file> with a fresh token, start the app, wait for saves/result.txt to answer that token → its KEY=VALUE pairs. The app ends after the request.
     An app ported before the save manager never answers (it starts its game instead): it is stopped and the request removed"""
     root, token = saves_folder(package), secrets.token_hex(6)
-    adb.shell(f'am force-stop {package}')
+    adb.shell(f'am force-stop {shlex.quote(package)}')
     body = '\n'.join([*lines, f'request={token}', 'quit']) + '\n'
     adb.shell(f'mkdir -p {shlex.quote(root)} && printf %s {shlex.quote(body)} > {shlex.quote(root + "/" + file)}')
     try: adb.start_app(package)
@@ -67,7 +90,7 @@ def _request(adb, package, file, lines, timeout=60):
             if kv.get('result') != 'ok': raise BuildError(f'the app could not do it: {kv.get("error", "no reason given")}')
             return kv
         time.sleep(0.5)
-    adb.shell(f'am force-stop {package}; rm -f {shlex.quote(root + "/" + file)}', check=False)
+    adb.shell(f'am force-stop {shlex.quote(package)}; rm -f {shlex.quote(root + "/" + file)}', check=False)
     raise BuildError(f'{package} did not answer within {timeout} s: an app ported before the save manager cannot export or import (port the game again), '
                      f'else see its log, {datapack.files_folder(package)}/log.txt')
 

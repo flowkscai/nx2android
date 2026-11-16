@@ -1,10 +1,10 @@
 # The nx2android desktop app: four tabs over porter.
-#   Port   pick the game folder (porter inspect), options, Port (porter port --progress json): the stage list, the current stage's bar, the log; then open or install the result
-#   Setup  the tools a port needs (porter doctor), downloading the missing ones (porter tools --download), and the saved settings (porter.config): prod.keys, the NDK,
-#          dotnet, adb, the output folder, the device
-#   Games  the game profiles (porter profiles --all)
-#   Saves  a ported game's save between the device and the PC (porter saves): the save folders on the device, a fresh export to a folder here, an import of a
-#          folder or .zip (a console's save, or an export)
+#   Port    pick the game folder (porter inspect), options, Port (porter port --progress json): the stage list, the current stage's bar, the log; then open or install the result
+#   Setup   the tools a port needs (porter doctor), downloading the missing ones (porter tools --download), and the saved settings (porter.config): prod.keys, the NDK,
+#           dotnet, adb, the output folder, the device
+#   Games   the game profiles (porter profiles --all)
+#   Saves   a ported game's save between the device and the PC (porter saves): the save folders on the device, a fresh export to a folder here, an import of a
+#           folder or .zip (a console's save, or an export)
 import html, os, subprocess, sys, time
 from pathlib import Path
 
@@ -81,7 +81,10 @@ class PortTab(QWidget):
         romfs = with_info(self.romfs_at, romfs_tip); romfs.layout().setStretch(0, 1)
         self.package = QLineEdit(); self.package.setPlaceholderText('the profile\'s package')   # porter port --package: a test install beside the player's other build
         self.package.setToolTip('Install under another package than the profile\'s (org.nx2a.<game>.test), beside your other build of the game.\n'
-                                'An app of another package has its own saves.')
+                                'An app of another package has its own saves. The name is lowercase unless Case sensitive is on.')
+        self.package_case = QCheckBox('Case sensitive')   # porter port --package-case: com.antutu.ABenchMark
+        self.package_case.setToolTip('Keep capitals in the package name, such as com.antutu.ABenchMark.\nOff: the name must be lowercase, as a profile\'s package is.')
+        pkg = QWidget(); ph = QHBoxLayout(pkg); ph.setContentsMargins(0, 0, 0, 0); ph.addWidget(self.package, 1); ph.addWidget(self.package_case)
         self.fps60 = QCheckBox('60 fps (the profile\'s own frame-rate cap, else the community\'s FPSLocker-Warehouse config of the game\'s build, fetched from GitHub)')
         self.touch = QCheckBox('Touch game: start with the on-screen gamepad hidden, so every touch but the menu button\'s goes to the game (the pause menu shows it again)')   # porter port --touch
         self.driver = QLineEdit(); self.driver.setPlaceholderText('the device\'s own')   # porter port --vulkan-driver
@@ -107,7 +110,7 @@ class PortTab(QWidget):
         f.addRow('App name', self.app_name); f.addRow('Game language', self.language)
         f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.replace_signer)
         f.addRow('RomFS on the device', romfs); f.addRow('', self.romfs_push)
-        f.addRow('Package', self.package); f.addRow('versionCode offset', self.vercode); f.addRow('Extra address space', headroom)
+        f.addRow('Package', pkg); f.addRow('versionCode offset', self.vercode); f.addRow('Extra address space', headroom)
         f.addRow('Vulkan driver', path_row(self.driver, self.pick_driver))
         f.addRow('System font', path_row(self.shared_font, self.pick_shared_font))
         f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.mt_replay); f.addRow('', self.debug); f.addRow('', self.experimental)
@@ -213,6 +216,7 @@ class PortTab(QWidget):
             if self.replace_signer.isChecked(): args.append('--replace-signer')
             args += self.romfs_args()
         if self.package.text().strip(): args += ['--package', self.package.text().strip()]
+        if self.package_case.isChecked(): args.append('--package-case')
         if self.vercode.value(): args += ['--vercode-offset', str(self.vercode.value())]
         if self.headroom.value() >= 0: args += ['--alias-headroom', str(self.headroom.value())]
         if self.fps60.isChecked(): args.append('--fps60')
@@ -425,9 +429,12 @@ class SavesTab(QWidget):
         v = QVBoxLayout(self)
         lab = QLabel('A ported game\'s save between the device and this PC. The app keeps its exports in its files folder on the device (<code>Android/data/&lt;package&gt;/files/saves</code>), '
                      'one folder each, the save\'s files as they are: the layout a console\'s save tools copy, so a console\'s save folder imports as it is. '
-                     'The game\'s pause menu has Export save and Import save too. Exporting or importing here stops the app on the device; an import exports the save it replaces there first.')
+                     'The game\'s pause menu has Export save and Import save too. Exporting or importing here stops the app on the device; an import exports the save it replaces there first. '
+                     'The list is every port on the device, including one installed under another package name.')
         lab.setWordWrap(True); lab.setTextFormat(Qt.RichText); v.addWidget(lab)
-        row = QHBoxLayout(); self.app = QComboBox(); self.app.currentIndexChanged.connect(self.refresh)
+        row = QHBoxLayout(); self.app = QComboBox(); self.app.setEditable(True); self.app.setInsertPolicy(QComboBox.NoInsert)
+        self.app.lineEdit().setPlaceholderText('a port on the device')
+        self.app.currentIndexChanged.connect(self.refresh); self.app.lineEdit().editingFinished.connect(self.on_typed)
         r = QPushButton('Refresh'); r.clicked.connect(self.load_apps)
         row.addWidget(QLabel('Game on the device:')); row.addWidget(self.app, 1); row.addWidget(r); v.addLayout(row)
         self.table = QTableWidget(0, 4); self.table.setHorizontalHeaderLabels(['Save folder', 'Made', 'Files', 'Size'])
@@ -444,7 +451,13 @@ class SavesTab(QWidget):
         self.status = QLabel(''); self.status.setWordWrap(True); v.addWidget(self.status)
         self.load_apps()
 
-    def pkg(self): return self.app.currentData() or ''
+    def pkg(self): return self.app.currentText().strip()
+
+    def on_typed(self):   # a package typed by hand; choosing from the list already refreshes
+        if self.busy or self.app.signalsBlocked() or self.app.currentText().strip() == (self.app.currentData() or ''): return
+        if not self.pkg():
+            self.table.setRowCount(0); self.set_busy(None); return
+        self.refresh()
 
     def set_busy(self, msg, show=True):   # msg: what runs (None: nothing); its line goes when it ends, a result written over it stays
         if msg and show: self.status.setText(msg)
@@ -456,10 +469,12 @@ class SavesTab(QWidget):
         def got(rows, code):
             cur = self.pkg(); self.app.blockSignals(True); self.app.clear()
             for pk in rows if isinstance(rows, list) else []: self.app.addItem(pk, pk)
-            if not self.app.count(): self.app.addItem('no ported game on the device', '')
-            i = self.app.findData(cur); self.app.setCurrentIndex(max(i, 0)); self.app.blockSignals(False)
+            if cur: self.app.setCurrentText(cur)
+            elif self.app.count(): self.app.setCurrentIndex(0)
+            self.app.blockSignals(False)
             self.set_busy(None); self.refresh()
             if not isinstance(rows, list): self.status.setText(f'[RED] {(rows or {}).get("error", "porter saves apps failed")}')
+            elif not rows and not cur: self.status.setText('No port on the device.')
         self.set_busy('looking for the device…'); call_json(self, ['saves', 'apps', '--json'], got)
 
     def refresh(self, show=True):
@@ -486,12 +501,14 @@ class SavesTab(QWidget):
         return got
 
     def export_new(self):
+        if not self.pkg(): return
         d = QFileDialog.getExistingDirectory(self, 'Folder to put the save in')
         if not d: return
         self.set_busy(f'exporting {self.pkg()}\'s save (the app is started on the device to copy it out)…')
         call_json(self, ['saves', 'export', d, '--package', self.pkg(), '--json'], self.done('the export'))
 
     def export_chosen(self):
+        if not self.pkg(): return
         it = self.table.item(self.table.currentRow(), 0) if self.table.currentRow() >= 0 else None
         if not it: self.status.setText('Choose a save folder in the list first.'); return
         d = QFileDialog.getExistingDirectory(self, 'Folder to put the save in')
@@ -500,6 +517,7 @@ class SavesTab(QWidget):
         call_json(self, ['saves', 'export', d, '--name', it.data(Qt.UserRole), '--package', self.pkg(), '--json'], self.done('the copy'))
 
     def import_(self, zipped):
+        if not self.pkg(): return
         src = QFileDialog.getOpenFileName(self, 'The save as a .zip', '', 'Zip archives (*.zip)')[0] if zipped else QFileDialog.getExistingDirectory(self, 'The save folder (its files at the top)')
         if not src: return
         if QMessageBox.question(self, 'Import the save', f'{Path(src).name} becomes {self.pkg()}\'s save on the device. The app is stopped; the save it replaces is exported '

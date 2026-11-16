@@ -72,6 +72,10 @@ python -m porter host --package org.nx2a.supermario3dworld
 
 It refuses when the game's code on the device was rewritten with other rewriter sources than this checkout's; then port the game again from its files. It also refuses a host built from another profile header than this checkout's (another layout, `--alias-headroom` or a derived profile); a header that differs only by defines added later that are off (`ADDED_DEFINES` in `porter/host.py`) is accepted. The data pack is not changed. How it works: [ARCHITECTURE.md](ARCHITECTURE.md#the-port).
 
+### Another package name
+
+`porter port --package <name>` builds the port under that package instead of the profile's (lowercase). `--package-case` keeps capitals, such as `com.antutu.ABenchMark`; the Port tab's **Case sensitive** box passes it. A profile's `package` row stays lowercase. How it works: [ARCHITECTURE.md](ARCHITECTURE.md#the-port).
+
 ## Layout
 
 - `porter/`: the port pipeline (`python -m porter`).

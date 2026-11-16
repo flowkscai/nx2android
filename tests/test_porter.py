@@ -1,5 +1,5 @@
 # Unit tests of the port pipeline's own parts (python -m unittest discover tests). They need no game files, toolchains or device.
-import hashlib, importlib.util, json, os, random, re, shutil, struct, sys, tempfile, unittest
+import hashlib, importlib.util, json, os, random, re, shlex, shutil, struct, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -243,6 +243,15 @@ class Misc(unittest.TestCase):
     def test_config_roundtrip(self):
         config.set_value('device', 'abc:5555'); self.assertEqual(config.load()['device'], 'abc:5555')
         with self.assertRaises(KeyError): config.set_value('nope', 'x')
+
+    def test_package_case(self):   # --package is lowercase; --package-case keeps a name such as Antutu's
+        self.assertEqual(pipeline.check_package('org.nx2a.game'), 'org.nx2a.game')
+        self.assertEqual(pipeline.check_package('com.antutu.ABenchMark', True), 'com.antutu.ABenchMark')
+        with self.assertRaises(pipeline.BuildError) as e: pipeline.check_package('com.antutu.ABenchMark')
+        self.assertIn('--package-case', str(e.exception))
+        with self.assertRaises(pipeline.BuildError): pipeline.check_package('Org.nx2a.game')
+        for bad in ('com.antutu.ABenchMark extra', '', 'org', '7com.a.b'):
+            with self.assertRaises(pipeline.BuildError): pipeline.check_package(bad, True)
 
     def test_version_code_grows_with_updates(self):
         self.assertLess(pipeline.version_code('v0'), pipeline.version_code('v65536'))
@@ -548,11 +557,14 @@ class FpsLocker(unittest.TestCase):   # porter/fpslocker.py: FPSLocker-Warehouse
 
 class Saves(unittest.TestCase):   # porter/saves.py: the save folders on the device, a .zip or folder to import (no device: the shell answers are made up)
     class FakeAdb:
-        def __init__(self, sizes, times, packages=('org.nx2a.a',)): self.sizes, self.times, self.packages, self.cmds = sizes, times, packages, []
+        def __init__(self, sizes, times, packages=('org.nx2a.a',), marked=()):
+            self.sizes, self.times, self.packages, self.marked, self.cmds = sizes, times, packages, marked, []
         def remote_sizes(self, rdir): return dict(self.sizes)
+        def installed(self, package): return package in self.packages
         def shell(self, script, **kw):
             self.cmds.append(script)
             if script.startswith('pm list packages'): return ''.join(f'package:{p}\n' for p in self.packages)
+            if 'nx2a-data.json' in script: return ''.join(f'{p}\n' for p in self.marked if shlex.quote(p) in script)
             if 'stat -c "%Y %n"' in script: return ''.join(f'{t} {n}\n' for n, t in self.times.items())
             return ''
 
@@ -573,6 +585,15 @@ class Saves(unittest.TestCase):   # porter/saves.py: the save folders on the dev
         self.assertEqual(saves.pick_app(two, 'org.nx2a.b'), 'org.nx2a.b')
         with self.assertRaises(BuildError): saves.pick_app(two, '')
         with self.assertRaises(BuildError): saves.pick_app(two, 'org.nx2a.c')
+        renamed = self.FakeAdb({}, {}, ('org.nx2a.a', 'com.example.ABenchMark', 'com.other.app'), marked=('com.example.ABenchMark',))
+        self.assertEqual(saves.apps(renamed), ['com.example.ABenchMark', 'org.nx2a.a'])   # nx2a-data.json marks a renamed port; another app is not one
+        self.assertTrue(any('nx2a-data.json' in c for c in renamed.cmds))
+        with self.assertRaises(BuildError): saves.pick_app(renamed, '')   # two ports: the original and the renamed one
+        only = self.FakeAdb({}, {}, ('com.example.ABenchMark', 'com.other.app'), marked=('com.example.ABenchMark',))
+        self.assertEqual(saves.pick_app(only, ''), 'com.example.ABenchMark')
+        self.assertEqual(saves.pick_app(renamed, 'com.example.ABenchMark'), 'com.example.ABenchMark')
+        with self.assertRaises(BuildError): saves.pick_app(renamed, 'com.example.missing')
+        with self.assertRaises(BuildError): saves.pick_app(renamed, 'not a package')
 
     def test_zip(self):   # a .zip of one folder imports that folder; one of loose files imports them; a path out of the archive is refused
         import zipfile

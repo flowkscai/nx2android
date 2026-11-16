@@ -40,6 +40,7 @@ class Options:
     debug: bool = False                # a development build: debug information, debuggable, DM_CTL
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
+    package_case: bool = False         # --package keeps capitals (com.antutu.ABenchMark). A profile's own package stays lowercase (android_profile.py)
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
     vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
@@ -65,6 +66,14 @@ def driver_lib_name(path):
     Turnip T30 is vulkan.purple.so, other Turnip builds vulkan.freedreno.so) never reached the app's library folder, and adrenotools fell back to the system's driver"""
     name = Path(path).name
     return name if name.startswith('lib') else f'lib{name}'
+
+
+def check_package(name, case=False):
+    """A package name. Lowercase unless case (--package-case, the Port tab's Case sensitive box). Raises BuildError."""
+    letters = 'A-Za-z' if case else 'a-z'
+    if isinstance(name, str) and re.fullmatch(rf'[{letters}][{letters}0-9_]*(\.[{letters}][{letters}0-9_]*)+', name): return name
+    hint = ': --package-case keeps capitals' if isinstance(name, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+', name) else ''
+    raise BuildError(f'not a package name: {name}{hint}')
 
 
 def app_stem(g, name):   # the file name of the APK and the data pack: the profile's iOS IPA name without .ipa (NeoTheWorldEndsWithYou)
@@ -268,8 +277,7 @@ class Port:
             if not o.experimental: raise BuildError(f'{what}: --experimental tries it anyway (profiles: `porter profiles`)')
             g, ap = self.experimental_profile(g, tid)
         self.g, self.ap = g, ap
-        self.package = o.package or ap.package
-        if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+', self.package): raise BuildError(f'not a package name: {self.package}')
+        self.package = check_package(o.package or ap.package, o.package_case)
         say(f'game profile: {g.id} {g.get("name", "")} (Android: {ap.status}' + (f', tested on {ap.tested}' if ap.tested else '') + ')')
         builds, need = g.builds(), g.words('shader_versions')
         have = nsp.nsp_versions(self.fam, builds)
