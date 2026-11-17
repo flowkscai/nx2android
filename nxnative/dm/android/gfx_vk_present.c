@@ -86,6 +86,9 @@ __attribute__((weak)) int dm_overlay_fps(void) { return 0; }   // front_android.
 __attribute__((weak)) int dm_pic_aa(void) { return PIC_AA_OFF; }   // front_android.c: Anti-aliasing (settings.txt aa=)
 __attribute__((weak)) int dm_pic_scale(void) { return PIC_SCALE_BILINEAR; }   // Scaling filter (settings.txt scale=)
 __attribute__((weak)) int dm_pic_sharp(void) { return 0; }   // Sharpness, percent (settings.txt sharpness=), for FSR and SGSR
+__attribute__((weak)) int dm_speed_mode(void) { return 0; }  // 0 Clock, 1 Pacing
+__attribute__((weak)) int dm_speed_val(void) { return 1; }   // 1..3 for Clock, 1..2 for Pacing
+__attribute__((weak)) int dm_pace_scale(void) { return 1; }
 __attribute__((weak)) int dm_save_note(char *out, int cap) { if (cap > 0) out[0] = 0; return OVX_IDLE; }   // front_android.c: the save manager's rows
 __attribute__((weak)) int dm_save_rows(ov_srow rows[OVM_ROWS]) { (void)rows; return 0; }
 __attribute__((weak)) int dm_overlay_custom(int layout, int ctl, float *x, float *y, float *s) { (void)layout; (void)ctl; (void)x; (void)y; *s = 1; return 0; }
@@ -390,10 +393,11 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 }
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
-static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Anti-aliasing", "Scaling filter", "Sharpness", "Export save", "Import save", "Face buttons", "Audio output", "Resume", ""};
+static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Anti-aliasing", "Scaling filter", "Sharpness", "Speed mode", "Speed", "Export save", "Import save", "Face buttons", "Audio output", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_AUDIO] = "Select"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
+static const char *const OVM_SPEED_MODES[2] = {"Clock", "Pacing"};
 static void ov_menu_panel(const ov_canvas *cv, int st) {
     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
     float rh = r[3], rw = r[2], gap = rh * 0.35f, sh = rh * 0.40f, sw = sh * 1.85f;
@@ -403,7 +407,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
         float need = 0;
         for (int i = 0; i < OVM_RESUME; i++) {
             if (i == OVM_SHARP && !ov_menu_sharp_on()) continue;   // the slider is not on the panel for Bilinear, Nearest or Area
-            float name = 0; if (i == OVM_AA) for (int k = 0; k < PIC_AA_N; k++) name = fmaxf(name, cv_text_w(pic_aa_name(k), is)); else if (i == OVM_SCALE) for (int k = 0; k < PIC_SCALE_N; k++) name = fmaxf(name, cv_text_w(pic_scale_name(k), is));
+            float name = 0; if (i == OVM_AA) for (int k = 0; k < PIC_AA_N; k++) name = fmaxf(name, cv_text_w(pic_aa_name(k), is)); else if (i == OVM_SCALE) for (int k = 0; k < PIC_SCALE_N; k++) name = fmaxf(name, cv_text_w(pic_scale_name(k), is)); else if (i == OVM_SPEED_MODE) name = fmaxf(cv_text_w(OVM_SPEED_MODES[0], is), cv_text_w(OVM_SPEED_MODES[1], is)); else if (i == OVM_SPEED) name = cv_text_w("3x", is);
             float lw = cv_text_w(OVM_LABELS[i], is), cw = name ? name : i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
             need = fmaxf(need, i == OVM_OPACITY || i == OVM_SHARP ? fmaxf(lw / 0.38f, cv_text_w("100%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
         }
@@ -433,8 +437,12 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_rrect(cv, t[0], t[1] - th / 2, t[0] + f * t[2], t[1] + th / 2, th / 2, C_ACCENT);
             cv_disc(cv, t[0] + f * t[2], t[1], kr, C_WHITE);
             char v[8]; snprintf(v, sizeof v, "%d%%", val); cv_text(cv, x1 - cv_text_w(v, is), cy, v, is, C_WHITE);
-        } else if (it == OVM_AA || it == OVM_SCALE) {   // the current mode; left and right (or the row) cycle it
-            const char *nm = it == OVM_AA ? pic_aa_name(dm_pic_aa()) : pic_scale_name(dm_pic_scale());
+        } else if (it == OVM_AA || it == OVM_SCALE || it == OVM_SPEED_MODE || it == OVM_SPEED) {   // the current mode; left and right (or the row) cycle it
+            char sp[8]; const char *nm;
+            if (it == OVM_AA) nm = pic_aa_name(dm_pic_aa());
+            else if (it == OVM_SCALE) nm = pic_scale_name(dm_pic_scale());
+            else if (it == OVM_SPEED_MODE) nm = OVM_SPEED_MODES[dm_speed_mode() ? 1 : 0];
+            else { snprintf(sp, sizeof sp, "%dx", dm_speed_val()); nm = sp; }
             cv_text(cv, x1 - cv_text_w(nm, is), cy, nm, is, C_WHITE);
         } else if (it == OVM_EXPORT && (st >> 20 & 15) != OVX_IDLE) {   // the export's outcome in place of its button: its name, or why there is none
             char nm[64], v[80]; int x = dm_save_note(nm, sizeof nm), vs = is;
@@ -528,6 +536,8 @@ static int64_t ov_panel_stamp(int menu) {
         s |= (uint64_t)dm_pic_aa() << 32;
         s |= (uint64_t)dm_pic_scale() << 40;
         s |= (uint64_t)(dm_pic_sharp() & 127) << 48;
+        s |= (uint64_t)(dm_speed_mode() & 1) << 56;
+        s |= (uint64_t)(dm_speed_val() & 7) << 57;
     }
     return (int64_t)s;
 }
@@ -536,7 +546,7 @@ static void ov_panel_keep(int menu) { ov_panel(menu); g_ov.panel = ov_panel_stam
 // The phone window uses the same menu raster as Vulkan, independently of the external swapchain.
 JNIEXPORT jint JNICALL Java_org_nx2a_ExternalActivity_externalMenuState(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_menu_state(); }
 JNIEXPORT jint JNICALL Java_org_nx2a_ExternalActivity_externalMenuPicture(JNIEnv *env, jclass cls) {   // the phone window's raster cache (ExternalActivity.menuRaster)
-    (void)env; (void)cls; return dm_pic_aa() | dm_pic_scale() << 8 | (dm_pic_sharp() & 127) << 16;
+    (void)env; (void)cls; return dm_pic_aa() | dm_pic_scale() << 8 | (dm_pic_sharp() & 127) << 16 | (dm_speed_mode() & 1) << 24 | (dm_speed_val() & 7) << 25;
 }
 JNIEXPORT jintArray JNICALL Java_org_nx2a_ExternalActivity_externalMenuPixels(JNIEnv *env, jclass cls, jint W, jint H, jint st) {
     (void)cls;
@@ -1076,8 +1086,9 @@ static void *present_thread(void *arg) {
             continue;
         }
         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
+        int drop = dm_pace_scale() > 1 && (g_pq_head - g_pq_tail > 1);
         pthread_mutex_unlock(&g_pq_mu);
-        if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
+        if (e.im) { last = e; if (!drop) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); } }
         pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }
     return NULL;

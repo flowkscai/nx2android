@@ -21,6 +21,8 @@ uint64_t now_ns(void);
 // This thread is doing the host's own heavy work (NVN submit / present: encoding Metal commands; on hardware that is the GPU's business and does not occupy a guest core). The same-core preemption approximation (hle_thread.c) does not count it as "running"
 extern __thread _Atomic int dm_host_work;
 uint64_t guest_ns(void);              // Guest clock (hle_os.c; does not advance while frozen, guest_clock_freeze)
+int dm_clock_scale(void);             // Runtime guest clock multiplier (1..3, default 1)
+void dm_set_clock_scale(int scale);
 int dm_detclock_enabled(void);
 void dm_guest_clock_advanced(void);
 uint64_t dm_guest_frame(void);        // Incremented each time the host presents a frame; unaffected by machine load

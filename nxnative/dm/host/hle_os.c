@@ -46,13 +46,58 @@ uint64_t now_ns(void) {
 // DM_DETCLOCK=<step ns> (for replay / test runs; product runs do not set it = wall clock): from the first present on the guest clock becomes "advance a fixed step per present", not following the wall clock --
 // the client's per-frame dt and the server tick catch-up snapshots are both determined by the present count, so frame N in a run is byte-for-byte comparable between two passes of the same replay (the foundation of byte-for-byte picture proof).
 // Before the first frame the wall clock is still used (the boot period has waits that poll by time, freezing would hang them); at the switch it continues from the guest clock value at that time, no jump. It does not advance while frozen.
-static _Atomic uint64_t g_gfrozen, g_glag, g_gdet, g_guest_frame; static _Atomic int g_gfz, g_gdet_on; static uint64_t g_gdet_step = 1;
+static _Atomic uint64_t g_gfrozen, g_gdet, g_guest_frame; static _Atomic int g_gfz, g_gdet_on; static uint64_t g_gdet_step = 1;
+static _Atomic uint32_t g_clk_seq; static uint64_t g_clk_real0, g_clk_guest0; static _Atomic int g_clk_scale = 1, g_clk_inited;
+static pthread_mutex_t g_gfz_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t dm_guest_frame(void) { return atomic_load(&g_guest_frame); }
 static int detclock_cfg(void) {
     static int c = -1; if (c < 0) { const char *e = getenv("DM_DETCLOCK"); g_gdet_step = e ? strtoull(e, 0, 0) : 0; c = g_gdet_step > 0; }
     return c;
 }
-static uint64_t wall_guest_ns(void) { return atomic_load(&g_gfz) ? atomic_load(&g_gfrozen) : now_ns() - atomic_load(&g_glag); }
+int dm_clock_scale(void) { int s = atomic_load(&g_clk_scale); return s >= 1 && s <= 3 ? s : 1; }
+static uint64_t wall_guest_ns(void) {
+    if (atomic_load(&g_gfz)) return atomic_load(&g_gfrozen);
+    if (!atomic_load(&g_clk_inited)) {
+        pthread_mutex_lock(&g_gfz_mu);
+        if (!atomic_load(&g_clk_inited)) {
+            uint64_t t = now_ns(); g_clk_real0 = t; g_clk_guest0 = t;
+            atomic_store(&g_clk_inited, 1);
+        }
+        pthread_mutex_unlock(&g_gfz_mu);
+    }
+    for (;;) {
+        uint32_t s0 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
+        if (s0 & 1u) continue;
+        uint64_t r0 = g_clk_real0, g0 = g_clk_guest0;
+        int sc = atomic_load_explicit(&g_clk_scale, memory_order_relaxed);
+        uint32_t s1 = atomic_load_explicit(&g_clk_seq, memory_order_acquire);
+        if (s0 == s1) {
+            uint64_t r = now_ns();
+            return g0 + (r > r0 ? (r - r0) * (uint64_t)(sc >= 1 && sc <= 3 ? sc : 1) : 0);
+        }
+    }
+}
+static uint64_t wall_guest_ns_locked(void) {
+    if (!atomic_load(&g_clk_inited)) {
+        uint64_t t = now_ns(); g_clk_real0 = t; g_clk_guest0 = t;
+        atomic_store(&g_clk_inited, 1);
+    }
+    if (atomic_load(&g_gfz)) return atomic_load(&g_gfrozen);
+    uint64_t r = now_ns(); int sc = dm_clock_scale();
+    return g_clk_guest0 + (r > g_clk_real0 ? (r - g_clk_real0) * (uint64_t)sc : 0);
+}
+void dm_set_clock_scale(int scale) {
+    scale = scale < 1 ? 1 : scale > 3 ? 3 : scale;
+    pthread_mutex_lock(&g_gfz_mu);
+    if (scale != atomic_load(&g_clk_scale)) {
+        uint64_t r = now_ns(), cur = wall_guest_ns_locked();
+        atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_acq_rel);
+        g_clk_real0 = r; g_clk_guest0 = cur;
+        atomic_store_explicit(&g_clk_scale, scale, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_gfz_mu);
+}
 uint64_t guest_ns(void) { return atomic_load(&g_gdet_on) ? atomic_load(&g_gdet) : wall_guest_ns(); }
 int dm_detclock_enabled(void) { return detclock_cfg() && atomic_load(&g_gdet_on); }
 void dm_guest_frame_tick(void) {
@@ -66,12 +111,18 @@ void dm_guest_frame_tick(void) {
     if (!atomic_load(&g_gfz)) { atomic_fetch_add(&g_gdet, g_gdet_step); dm_guest_clock_advanced(); }
 }
 static void guest_clock_freeze_apply(int on) {
-    if (on && !atomic_load(&g_gfz)) { atomic_store(&g_gfrozen, now_ns() - atomic_load(&g_glag)); atomic_store(&g_gfz, 1); }
-    else if (!on && atomic_load(&g_gfz)) { atomic_store(&g_glag, now_ns() - atomic_load(&g_gfrozen)); atomic_store(&g_gfz, 0); }
+    if (on && !atomic_load(&g_gfz)) { atomic_store(&g_gfrozen, wall_guest_ns_locked()); atomic_store(&g_gfz, 1); }
+    else if (!on && atomic_load(&g_gfz)) {
+        uint64_t r = now_ns(), cur = atomic_load(&g_gfrozen);
+        atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_acq_rel);
+        g_clk_real0 = r; g_clk_guest0 = cur;
+        atomic_fetch_add_explicit(&g_clk_seq, 1, memory_order_release);
+        atomic_store(&g_gfz, 0);
+    }
 }
 // Freezing has several unrelated reasons (0 freeze tick for testing / loading screen, 1 App in background, 2 system keyboard up): freeze if any holds, release only when all are lifted --
 // otherwise "switch to background and back while the keyboard is up" would be released early by the unfreeze on returning to foreground
-static pthread_mutex_t g_gfz_mu = PTHREAD_MUTEX_INITIALIZER; static unsigned g_gfz_reasons;
+static unsigned g_gfz_reasons;
 // A suspended application does not run: Horizon suspends the whole process out of focus, iOS suspends a background app. The host freezes the guest clock in the background but its
 // guest threads go on until they block, so a guest reading the clock twice there saw no time pass. Super Mario Galaxy 2's frame pacing (main+0x5926a8) took the interval between two
 // frames as its period, got 0, and the next frame's loop that steps by it (main+0x9abd0) never ended. Guest reads of the system counter (the cntpct gate, svc GetSystemTick) wait while

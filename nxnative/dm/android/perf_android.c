@@ -237,6 +237,7 @@ static int64_t work_p95(void) { return work_pct(95); }
 // Cardfight!! Vanguard Dear Days 2 presents at interval 1 (60 fps on the Switch) and steps by the time that really passed: its boot screens changed every 3.0 s at 60 and at
 // 30 fps alike (screen recordings on the Odin 2), so a 30 cap halves the work without slowing the game
 __attribute__((weak)) int dm_fps_ceiling(void) { return 0; }
+__attribute__((weak)) int dm_pace_scale(void) { return 1; }
 static int fps_pin(void);
 static int fps_cap_step(void) {
     static int s = -1;
@@ -245,7 +246,7 @@ static int fps_cap_step(void) {
 }
 uint64_t dm_present_period_adapt(uint64_t period) {
     g_game_period = period;
-    if (!period) return period;
+    if (!period || dm_pace_scale() > 1) return period;
     if (!adaptive_enabled()) {
         g_step = fps_cap_step();   // the ceiling's present-thread wait is pacing, not work for ADPF load hints
         return g_step && (uint64_t)STEPS[g_step] > period ? (uint64_t)STEPS[g_step] : period;

@@ -2069,6 +2069,9 @@ static void present_cfg(const win_t *o) {
         m ? "DM_PRESENT_INTERVAL" : "game profile present_interval", o->interval, scr > 0 ? "window, fixed 60 Hz" : "no window, fixed 60 Hz");
 }
 static int present_itv(const win_t *o) { int c = fps_step_cap(), k = atomic_load(&g_fs_k); return c ? (k && fstep_on() ? k : 60 / c) : g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; }   // vsyncs per frame that presentation follows
+static _Atomic int g_pace_scale = 1;
+int dm_pace_scale(void) { int s = atomic_load(&g_pace_scale); return s == 2 ? 2 : 1; }
+void dm_set_pace_scale(int scale) { atomic_store(&g_pace_scale, scale == 2 ? 2 : 1); }
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
     int was = atomic_load(&g_game_itv), want = o->interval > 0 ? o->interval : 1;
@@ -2077,8 +2080,10 @@ static uint64_t present_period(const win_t *o) {
         if (want < 2) atomic_store(&g_itv2_since, 0);
         else if (was < 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
-    int itv = present_itv(o), hz = g_hz;
-    return dm_present_period_adapt(hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0);
+    int itv = present_itv(o), hz = g_hz, ps = dm_pace_scale();
+    uint64_t p = hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    if (ps > 1 && p) p /= (uint64_t)ps;
+    return dm_present_period_adapt(p);
 }
 // The period the acquire thread declares to the scheduler (set_time_constraint): the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
 // Declaring the longer hold let the performance controller move the game to the efficiency cores at half the clock (TOTK on an iPhone: 3.4 → 1.5 GHz and 65% → 5% on performance

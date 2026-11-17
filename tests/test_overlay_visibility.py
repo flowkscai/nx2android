@@ -55,6 +55,7 @@ static void save_export(void) {}
 static void menu_audio(void) {}
 static void menu_close(void) {}
 static void dm_overlay_redraw(void) {}
+static void speed_step(int item, int dir) { (void)item; (void)dir; }
 ''' + visible + hidden + hit + menu + r'''
 // Synthetic Android events. The production dispatch and touch handlers below consume them.
 enum { AINPUT_SOURCE_TOUCHSCREEN = 1, AINPUT_SOURCE_GAMEPAD = 2, AINPUT_SOURCE_JOYSTICK = 4 };

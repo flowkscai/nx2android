@@ -203,6 +203,14 @@ static void wake(thr_t *t, int64_t res) {
     thr_t *self = pthread_getspecific(g_keythr);   // the woken thread is pinned to this core with a higher priority: on Horizon it preempts at once (see dm_yield_to_core_peers)
     if (self && self != t && !t->host_owned && t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
 }
+__attribute__((weak)) int dm_clock_scale(void) { return 1; }
+static inline int64_t scale_wait_ns(int64_t ns) {
+    if (ns <= 0) return ns;
+    int sc = dm_clock_scale();
+    if (sc <= 1) return ns;
+    int64_t w = ns / sc;
+    return w > 0 ? w : 1;
+}
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
@@ -210,7 +218,8 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
-    if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
+    int64_t wall_ns = (ns > 0 && !det_wait) ? scale_wait_ns(ns) : ns;
+    if (wall_ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += wall_ns / 1000000000; dl.tv_nsec += wall_ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     // Spin before parking: the game's threads hand work to each other thousands of times a second (Pokémon Scarlet's job workers wait ~2,500 times a second each, a
     // quarter of a millisecond on average), and a parked thread waits for the wake to reach a sleeping core as well; a wake that comes within the spin costs neither.
@@ -740,7 +749,7 @@ void dm_guest_sleep_ns(int64_t ns) {
         return;
     }
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
-    sleep_precise(now_ns() + (uint64_t)ns);
+    sleep_precise(now_ns() + (uint64_t)scale_wait_ns(ns));
     if (me) me->sleeping = 0;
 }
 int svc_thread(int num, uint64_t *regs) {
@@ -962,7 +971,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x18: {  // WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         wait_bt("WaitSynchronization", (int64_t)regs[3], regs[29]);
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
-        int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
+        int use_guest = dm_detclock_enabled() || dm_clock_scale() > 1;
+        int64_t deadline = ns > 0 ? (use_guest ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
         G_lock();
         int64_t r; int idx = -1;
         for (;;) {
@@ -971,7 +981,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
             if (bad) { r = R_BAD_HANDLE; break; }
             if (idx >= 0) { r = 0; break; }
-            int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
+            use_guest = dm_detclock_enabled() || dm_clock_scale() > 1;
+            int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (use_guest ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
             t->whs = hs; t->whn = n; int64_t br = block(t, 4, left); t->whs = NULL; t->whn = 0;
             if (br == R_TIMEOUT) { r = R_TIMEOUT; break; }

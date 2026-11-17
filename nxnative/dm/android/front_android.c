@@ -78,6 +78,27 @@ static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_aa, g_set_scale, g_set_sharp;   // Anti-aliasing, Scaling filter, Sharpness (present_pic.h). 0: off, bilinear, no sharpening
+static _Atomic int g_set_speed_mode, g_set_speed = 1;  // Speed mode (0 Clock, 1 Pacing) and multiplier (Clock 1..3, Pacing 1..2)
+void dm_set_clock_scale(int scale); void dm_set_pace_scale(int scale);
+static int speed_clamp(int mode, int val) { int mx = mode ? 2 : 3; return val < 1 ? 1 : val > mx ? mx : val; }
+static void speed_apply(void) {
+    int mode = atomic_load(&g_set_speed_mode) ? 1 : 0;
+    int val = speed_clamp(mode, atomic_load(&g_set_speed));
+    atomic_store(&g_set_speed, val);
+    dm_set_clock_scale(mode == 0 ? val : 1);
+    dm_set_pace_scale(mode == 1 ? val : 1);
+}
+static void speed_step(int item, int dir) {
+    if (item == OVM_SPEED_MODE) {
+        atomic_store(&g_set_speed_mode, atomic_load(&g_set_speed_mode) ? 0 : 1);
+        atomic_store(&g_set_speed, 1);   // reset multiplier to 1x when switching scaling mode
+    } else {
+        int mode = atomic_load(&g_set_speed_mode) ? 1 : 0, n = mode ? 2 : 3;
+        int cur = speed_clamp(mode, atomic_load(&g_set_speed));
+        atomic_store(&g_set_speed, ((cur - 1 + dir + n) % n) + 1);
+    }
+    speed_apply();
+}
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
@@ -99,6 +120,8 @@ static void settings_load(void) {
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
+        else if (sscanf(line, "speed_mode=%d", &v) == 1) atomic_store(&g_set_speed_mode, v != 0);
+        else if (sscanf(line, "speed=%d", &v) == 1) atomic_store(&g_set_speed, v);
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>[,<hidden>]: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, hid = 0, l, i;
             if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d,%d", lay, name, &x, &y, &z, &hid) < 5 || (i = ctl_named(name)) < 0) continue;
@@ -111,6 +134,7 @@ static void settings_load(void) {
         else if (sscanf(line, "menu_y=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][1], v + 1); }   // the editor
     }
     fclose(f);
+    speed_apply();
 }
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
@@ -118,6 +142,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     char pic[96]; pic_set ps = {atomic_load(&g_set_aa), atomic_load(&g_set_scale), atomic_load(&g_set_sharp)}; pic_settings_write(pic, (int)sizeof pic, &ps); fputs(pic, f);
+    fprintf(f, "speed_mode=%d\nspeed=%d\n", atomic_load(&g_set_speed_mode) ? 1 : 0, speed_clamp(atomic_load(&g_set_speed_mode) ? 1 : 0, atomic_load(&g_set_speed)));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
@@ -505,6 +530,8 @@ int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_men
 int dm_pic_aa(void) { return pic_clamp_aa(atomic_load(&g_set_aa)); }   // the present reads these; DM_VK_AA / DM_VK_SCALE / DM_VK_SHARP override them for one run
 int dm_pic_scale(void) { return pic_clamp_scale(atomic_load(&g_set_scale)); }
 int dm_pic_sharp(void) { return pic_clamp_sharp(atomic_load(&g_set_sharp)); }
+int dm_speed_mode(void) { return atomic_load(&g_set_speed_mode) ? 1 : 0; }
+int dm_speed_val(void) { return speed_clamp(dm_speed_mode(), atomic_load(&g_set_speed)); }
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
     atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
@@ -560,6 +587,7 @@ static void menu_do(int item) {
     else if (item == OVM_OPACITY || item == OVM_SHARP) return;   // (the slider is dragged, or stepped with left and right)
     else if (item == OVM_AA) { atomic_store(&g_set_aa, (atomic_load(&g_set_aa) + 1) % PIC_AA_N); settings_save(); }
     else if (item == OVM_SCALE) { atomic_store(&g_set_scale, (atomic_load(&g_set_scale) + 1) % PIC_SCALE_N); settings_save(); }
+    else if (item == OVM_SPEED_MODE || item == OVM_SPEED) { speed_step(item, 1); settings_save(); }
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
     else if (item == OVM_AUDIO) { menu_audio(); }
@@ -607,10 +635,11 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
         atomic_store(&g_menu_hi, hi); dm_overlay_redraw();
     } else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_OPACITY) { menu_opacity(atomic_load(&g_set_opacity) + (bit == DM_BTN_LEFT ? -5 : 5)); settings_save(); }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_SHARP) { menu_sharp(atomic_load(&g_set_sharp) + (bit == DM_BTN_LEFT ? -25 : 25)); settings_save(); }
-    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && (item == OVM_AA || item == OVM_SCALE)) {
+    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && (item == OVM_AA || item == OVM_SCALE || item == OVM_SPEED_MODE || item == OVM_SPEED)) {
         int dir = bit == DM_BTN_RIGHT ? 1 : -1;
         if (item == OVM_AA) atomic_store(&g_set_aa, (atomic_load(&g_set_aa) + dir + PIC_AA_N) % PIC_AA_N);
-        else atomic_store(&g_set_scale, (atomic_load(&g_set_scale) + dir + PIC_SCALE_N) % PIC_SCALE_N);
+        else if (item == OVM_SCALE) atomic_store(&g_set_scale, (atomic_load(&g_set_scale) + dir + PIC_SCALE_N) % PIC_SCALE_N);
+        else speed_step(item, dir);
         settings_save(); dm_haptics_android_tap(); dm_overlay_redraw();
     }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_TAB) menu_tab(tab + (bit == DM_BTN_LEFT ? -1 : 1));
@@ -1238,6 +1267,7 @@ static void env_file(const char *path) {   // KEY=VALUE per line (# comments): s
         char *eq = strchr(line, '='); if (!eq) continue; *eq = 0; setenv(line, eq + 1, 1);
     }
     fclose(f);
+    speed_apply();
 }
 // ---- a RomFS outside the app's files folder (env.txt's DM_ROMFS, written by porter install --romfs-at: a game dump another app also reads, a folder on the SD card). The app
 // reads it only with All files access (the appop MANAGE_EXTERNAL_STORAGE, Android 11 on) or, on Android 10, READ_EXTERNAL_STORAGE in the legacy storage view: mkapk.py asks

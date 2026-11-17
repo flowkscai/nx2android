@@ -57,6 +57,16 @@ class PresentPicture(unittest.TestCase):
             static char g_root[512];
             static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps, g_set_opacity = 60, g_set_grid, g_set_labels = -1;
             static _Atomic int g_set_aa, g_set_scale, g_set_sharp;
+            static _Atomic int g_set_speed_mode, g_set_speed = 1;
+            static int stub_clk = 1, stub_pace = 1;
+            static int speed_clamp(int mode, int val) { int mx = mode ? 2 : 3; return val < 1 ? 1 : val > mx ? mx : val; }
+            static void speed_apply(void) {
+                int mode = atomic_load(&g_set_speed_mode) ? 1 : 0;
+                int val = speed_clamp(mode, atomic_load(&g_set_speed));
+                atomic_store(&g_set_speed, val);
+                stub_clk = mode == 0 ? val : 1;
+                stub_pace = mode == 1 ? val : 1;
+            }
             static _Atomic int g_cust[2][2][OV_N][4];
             static const char *const LAYOUT_NAMES[2] = {"tablet", "phone"};
             static int ctl_named(const char *n) { (void)n; return -1; }
@@ -232,6 +242,27 @@ class PresentPicture(unittest.TestCase):
             static struct { uint8_t *px; uint32_t w, h, sh, pw, ph; int64_t panel; } g_ov;
             static _Atomic int g_set_overlay = 1, g_set_rumble, g_set_fps, g_set_opacity = 60;
             static _Atomic int g_set_aa, g_set_scale, g_set_sharp;
+            static _Atomic int g_set_speed_mode, g_set_speed = 1;
+            static int stub_clk = 1, stub_pace = 1;
+            static int speed_clamp(int mode, int val) { int mx = mode ? 2 : 3; return val < 1 ? 1 : val > mx ? mx : val; }
+            static void speed_apply(void) {
+                int mode = atomic_load(&g_set_speed_mode) ? 1 : 0;
+                int val = speed_clamp(mode, atomic_load(&g_set_speed));
+                atomic_store(&g_set_speed, val);
+                stub_clk = mode == 0 ? val : 1;
+                stub_pace = mode == 1 ? val : 1;
+            }
+            static void speed_step(int item, int dir) {
+                if (item == OVM_SPEED_MODE) {
+                    atomic_store(&g_set_speed_mode, atomic_load(&g_set_speed_mode) ? 0 : 1);
+                    atomic_store(&g_set_speed, 1);
+                } else {
+                    int mode = atomic_load(&g_set_speed_mode) ? 1 : 0, n = mode ? 2 : 3;
+                    int cur = speed_clamp(mode, atomic_load(&g_set_speed));
+                    atomic_store(&g_set_speed, ((cur - 1 + dir + n) % n) + 1);
+                }
+                speed_apply();
+            }
             static _Atomic int g_menu, g_menu_hi = -1, g_menu_tab, g_tx_on, g_tx_ver, g_edit, g_ed_st;
             static _Atomic int g_sp_on, g_sp_hi, g_sp_ver, g_sv_st, g_sv_n;
             static int saves, redraws, taps;
@@ -268,7 +299,8 @@ class PresentPicture(unittest.TestCase):
                 g_ov.px = calloc((size_t)g_ov.w * g_ov.ph, 4); assert(g_ov.px);
                 atomic_store(&g_menu, 1); atomic_store(&g_menu_tab, 1); atomic_store(&g_menu_hi, 3);
                 int menu = dm_menu_state();
-                assert(menu >= 0 && ov_menu_item(1, 3) == OVM_AA && ov_menu_item(1, 4) == OVM_SCALE && ov_menu_item(1, 5) == OVM_EXPORT);
+                assert(menu >= 0 && ov_menu_item(1, 3) == OVM_AA && ov_menu_item(1, 4) == OVM_SCALE && ov_menu_item(1, 5) == OVM_SPEED_MODE);
+                assert(ov_menu_item(1, 6) == OVM_SPEED && ov_menu_item(1, 7) == OVM_EXPORT);
                 assert(panel_sync(menu) == 1);
                 uint8_t *off = malloc((size_t)g_ov.w * g_ov.ph * 4); assert(off); memcpy(off, g_ov.px, (size_t)g_ov.w * g_ov.ph * 4);
                 assert(panel_sync(dm_menu_state()) == 0 && same(off));
@@ -290,7 +322,7 @@ class PresentPicture(unittest.TestCase):
                 assert(panel_sync(dm_menu_state()) == 1 && !same(off));
                 printf("panel scale redraw %s\n", pic_scale_name(dm_pic_scale()));
                 menu_key(DM_BTN_DOWN);
-                assert(ov_menu_item(1, atomic_load(&g_menu_hi)) == OVM_EXPORT);
+                assert(ov_menu_item(1, atomic_load(&g_menu_hi)) == OVM_SPEED_MODE);
                 menu_key(DM_BTN_UP);
                 assert(ov_menu_item(1, atomic_load(&g_menu_hi)) == OVM_SCALE);
                 menu_key(DM_BTN_RIGHT);
@@ -313,6 +345,27 @@ class PresentPicture(unittest.TestCase):
                 printf("panel sharp drag %d\n", dm_pic_sharp());
                 memcpy(off, g_ov.px, (size_t)g_ov.w * g_ov.ph * 4);
                 assert(panel_sync(dm_menu_state()) == 0 && same(off));
+                atomic_store(&g_menu_hi, 7); menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 0 && dm_speed_val() == 2 && stub_clk == 2 && stub_pace == 1);
+                assert(panel_sync(dm_menu_state()) == 1);
+                menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 0 && dm_speed_val() == 3 && stub_clk == 3 && stub_pace == 1);
+                menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 0 && dm_speed_val() == 1 && stub_clk == 1 && stub_pace == 1);
+                menu_key(DM_BTN_LEFT);
+                assert(dm_speed_mode() == 0 && dm_speed_val() == 3);
+                atomic_store(&g_menu_hi, 6); menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 1 && dm_speed_val() == 1 && stub_clk == 1 && stub_pace == 1);
+                assert(panel_sync(dm_menu_state()) == 1);
+                atomic_store(&g_menu_hi, 7); menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 1 && dm_speed_val() == 2 && stub_clk == 1 && stub_pace == 2);
+                menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 1 && dm_speed_val() == 1 && stub_clk == 1 && stub_pace == 1);
+                menu_key(DM_BTN_RIGHT);
+                assert(dm_speed_mode() == 1 && dm_speed_val() == 2);
+                atomic_store(&g_menu_hi, 6); menu_key(DM_BTN_LEFT);
+                assert(dm_speed_mode() == 0 && dm_speed_val() == 1 && stub_clk == 1 && stub_pace == 1);
+                atomic_store(&g_menu_hi, 3);
                 atomic_store(&g_tx_on, 1);
                 int tx = dm_menu_state();
                 g_ov.panel = ov_panel_stamp(tx);

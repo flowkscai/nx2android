@@ -223,8 +223,8 @@ public class ExternalActivity extends NativeActivity implements ExternalDisplay.
         }
         private void drawMenu(Canvas c, float[] data) {
             Bitmap bitmap = menuRaster(menuState); if (bitmap == null) return;
-            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .92f / (10 * .115f + 2 * .03f));
-            float w = Math.min(.95f * H * scale, W * .96f), h = (10 * .115f + 2 * .03f) * H * scale;
+            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .92f / (12 * .115f + 2 * .03f));
+            float w = Math.min(.95f * H * scale, W * .96f), h = (12 * .115f + 2 * .03f) * H * scale;
             paint.setAlpha(255); c.drawBitmap(bitmap, null, new RectF((W-w)/2, (H-h)/2, (W+w)/2, (H+h)/2), paint);
         }
         private void drawEditor(Canvas c, float[] data, int state) {
